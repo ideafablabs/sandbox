@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Exec=/home/sandbox/src/SARndbox-2.8/run-sandbox.sh
+Hidden=false
+X-MATE-Autostart-enabled=true
+Name[en_US]=run-sandbox
+Name=run-sandbox
+Comment[en_US]=Start SandBox Software
+Comment=Start SandBox Software

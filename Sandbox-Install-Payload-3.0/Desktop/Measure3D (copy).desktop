@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Terminal=false
+Icon[en_US]=mate-panel-launcher
+Name[en_US]=Measure3D
+Exec=gnome-terminal -e /home/sandbox/src/SARndbox-2.8/bin/Measure3D.sh
+Name=RawKinectViewer
+Icon=mate-panel-launcher
+Comment[en_US]=Measure 3D extents of sand surface
+GenericName[en_US]=Measure 3D extents of sand surface
