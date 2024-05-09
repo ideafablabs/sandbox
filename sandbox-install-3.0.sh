@@ -30,7 +30,7 @@ sudo /usr/local/bin/KinectUtil getCalib 0
 
 #
 cd ~
-wget https://github.com/ideafablabs/sandbox/raw/master/Sandbox-Install-Payload-3.0.tar.gz
+wget https://github.com/ideafablabs/sandbox/raw/main/Sandbox-Install-Payload-3.0.tar.gz
 tar xfz Sandbox-Install-Payload-3.0.tar.gz
 
 mkfifo ~/src/SARndbox-2.8/share/SARndbox-2.8/Control.fifo
@@ -43,6 +43,7 @@ gsettings set org.cinnamon.desktop.screensaver idle-activation-enabled false
 #To disable the power management settings:
 gsettings set org.cinnamon.settings-daemon.plugins.power sleep-display-ac 0
 gsettings set org.cinnamon.settings-daemon.plugins.power sleep-display-battery 0
+gsettings set org.cinnamon.settings-daemon.plugins.power button-power shutdown
 
 #To disable the lock screen:
 gsettings set org.cinnamon.desktop.session idle-delay 0
@@ -51,5 +52,5 @@ gsettings set org.cinnamon.desktop.session idle-delay 0
 gsettings set org.cinnamon.desktop.sound volume-sound-enabled false
 
 #set the desktop background to the logo
-gsettings set org.cinnamon.desktop.background picture-uri file:///usr/sandbox/Picture/ifl-desktop-bg.png
+gsettings set org.cinnamon.desktop.background picture-uri file:///usr/sandbox/Pictures/ifl-desktop-bg.png
 
