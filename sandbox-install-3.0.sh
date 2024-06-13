@@ -52,5 +52,5 @@ gsettings set org.cinnamon.desktop.session idle-delay 0
 gsettings set org.cinnamon.desktop.sound volume-sound-enabled false
 
 #set the desktop background to the logo
-gsettings set org.cinnamon.desktop.background picture-uri file:///usr/sandbox/Pictures/ifl-desktop-bg.png
+gsettings set org.cinnamon.desktop.background picture-uri /home/sandbox/Pictures/ifl-desktop-bg.png
 
