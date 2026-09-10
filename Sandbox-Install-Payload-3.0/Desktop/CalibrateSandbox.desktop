@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Terminal=false
+Icon[en_US]=mate-panel-launcher
+Name[en_US]=Calibrate Sandbox
+Exec=/home/sandbox/src/SARndbox-2.8/bin/CalibrateSandbox.sh
+Name=Calibrate Sandbox
+Icon=mate-panel-launcher
+GenericName[en_US]=Calibrate Sandbox
+Comment[en_US]=Base plane, box corners and projector calibration in one window
