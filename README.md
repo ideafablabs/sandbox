@@ -18,8 +18,12 @@ bash sandbox-install-3.0.sh
 ```
 
 It builds Vrui, Kinect and SARndbox, asks you to plug in the camera for the
-intrinsic calibration, installs the payload and turns off the screensaver and
-display sleep.
+intrinsic calibration, installs the payload and applies the desktop settings:
+screensaver and display sleep off, sounds off, the `ifl-desktop-bg.png`
+background, and larger desktop icons with bigger labels. The settings work on
+Cinnamon (and MATE or GNOME if that is what the machine runs); the script checks
+that the background really took and says so in its summary. Use
+`--icon-zoom largest` (or `standard`, `large`, `larger`) to change the icon size.
 
 ## Updating an existing install
 

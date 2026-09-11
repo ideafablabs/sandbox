@@ -19,6 +19,7 @@
 #   --recalibrate-camera   run "KinectUtil getCalib" again even if calibration data exists
 #   --skip-settings        leave the Cinnamon screensaver / power / background settings alone
 #   --local-payload FILE   use a local payload tarball instead of downloading it
+#   --icon-zoom LEVEL      desktop icon size: standard, large, larger (default) or largest
 #   -h, --help             show this text
 
 set -o pipefail
@@ -32,6 +33,8 @@ KINECT_CALIB_GLOB=/usr/local/etc/Vrui-8.0/Kinect-3.10/IntrinsicParameters-*.dat
 STAMP=$(date +%Y%m%d-%H%M%S)
 
 PAYLOAD_ONLY=0; FORCE_BUILD=0; RECALIBRATE=0; SKIP_SETTINGS=0; LOCAL_PAYLOAD=""
+DESKTOP_ICON_ZOOM=${DESKTOP_ICON_ZOOM:-larger}   # desktop icon size (see --icon-zoom)
+DESKTOP_FONT_SIZE=${DESKTOP_FONT_SIZE:-13}       # point size of the desktop icon labels
 while [ $# -gt 0 ]; do
     case "$1" in
         --payload-only)       PAYLOAD_ONLY=1 ;;
@@ -39,7 +42,8 @@ while [ $# -gt 0 ]; do
         --recalibrate-camera) RECALIBRATE=1 ;;
         --skip-settings)      SKIP_SETTINGS=1 ;;
         --local-payload)      shift; LOCAL_PAYLOAD=$(readlink -f "$1") ;;
-        -h|--help)            sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --icon-zoom)          shift; DESKTOP_ICON_ZOOM=$1 ;;
+        -h|--help)            sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -181,17 +185,135 @@ else
 fi
 
 # ---------------------------------------------------------------------- desktop settings
+# Background picture, no screensaver / display sleep, sound off, bigger desktop icons.
+# DESKTOP_ICON_ZOOM: smallest smaller small standard large larger largest (--icon-zoom)
+BG_IMAGE=$HOME/Pictures/ifl-desktop-bg.png
+
+has_schema() { gsettings list-schemas 2>/dev/null | grep -qx "$1"; }
+gs() { gsettings set "$@" 2>/dev/null; }
+
+zoom_number() {   # zoom name -> number used in nemo's desktop-metadata file
+    case "$1" in
+        smallest) echo 0 ;; smaller) echo 1 ;; small) echo 2 ;; standard) echo 3 ;;
+        large) echo 4 ;; larger) echo 5 ;; largest) echo 6 ;; *) echo 5 ;;
+    esac
+}
+
+set_nemo_desktop_zoom() {
+    # nemo-desktop keeps the desktop icon size per monitor in this file and only falls
+    # back to the gsettings default when the file has no entry, so write it explicitly.
+    python3 - "$HOME/.config/nemo/desktop-metadata" "$(zoom_number "$DESKTOP_ICON_ZOOM")" <<'PYEOF2'
+import os, re, sys
+path, level = sys.argv[1], sys.argv[2]
+key = "nemo-icon-view-zoom-level=" + level
+try:
+    lines = open(path).read().splitlines()
+except OSError:
+    lines = []
+out, state = [], {"in_monitor": False, "done": False, "found": False}
+
+def close_section():
+    if state["in_monitor"] and not state["done"]:
+        trailing = []
+        while out and out[-1].strip() == "":
+            trailing.append(out.pop())
+        out.append(key)
+        out.extend(trailing)
+
+for line in lines:
+    if line.startswith("["):
+        close_section()
+        state["in_monitor"] = re.match(r"\[desktop-monitor-\d+\]", line) is not None
+        state["found"] = state["found"] or state["in_monitor"]
+        state["done"] = False
+        out.append(line)
+    elif state["in_monitor"] and line.startswith("nemo-icon-view-zoom-level="):
+        out.append(key)
+        state["done"] = True
+    else:
+        out.append(line)
+close_section()
+if not state["found"]:
+    out = ["[desktop-monitor-0]", key, ""] + out
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as f:
+    f.write("\n".join(out).rstrip("\n") + "\n")
+PYEOF2
+}
+
 if [ $SKIP_SETTINGS -eq 0 ] && command -v gsettings >/dev/null 2>&1; then
-    say "Applying desktop settings (screensaver off, no display sleep, sound off, background)"
-    gsettings set org.cinnamon.desktop.screensaver idle-activation-enabled false 2>/dev/null
-    gsettings set org.cinnamon.desktop.screensaver lock-enabled false 2>/dev/null
-    gsettings set org.cinnamon.settings-daemon.plugins.power sleep-display-ac 0 2>/dev/null
-    gsettings set org.cinnamon.settings-daemon.plugins.power sleep-display-battery 0 2>/dev/null
-    gsettings set org.cinnamon.settings-daemon.plugins.power button-power shutdown 2>/dev/null
-    gsettings set org.cinnamon.desktop.session idle-delay 0 2>/dev/null
-    gsettings set org.cinnamon.desktop.sound volume-sound-enabled false 2>/dev/null
-    gsettings set org.cinnamon.desktop.background picture-uri "file://$HOME/Pictures/ifl-desktop-bg.png" 2>/dev/null
-    note "Desktop settings:   applied"
+    say "Applying desktop settings"
+    # Reach the desktop session's settings even when this script runs over SSH
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+    fi
+    [ -z "${DISPLAY:-}" ] && export DISPLAY=:0
+    APPLIED=""
+
+    if has_schema org.cinnamon.desktop.background; then                     # Cinnamon
+        gs org.cinnamon.desktop.screensaver idle-activation-enabled false
+        gs org.cinnamon.desktop.screensaver lock-enabled false
+        gs org.cinnamon.settings-daemon.plugins.power sleep-display-ac 0
+        gs org.cinnamon.settings-daemon.plugins.power sleep-display-battery 0
+        gs org.cinnamon.settings-daemon.plugins.power button-power shutdown
+        gs org.cinnamon.desktop.session idle-delay 0
+        gs org.cinnamon.desktop.sound volume-sound-enabled false
+        gs org.cinnamon.desktop.background picture-options zoom
+        gs org.cinnamon.desktop.background picture-uri "file://$BG_IMAGE"
+        APPLIED="Cinnamon"
+    fi
+    if has_schema org.mate.background; then                                  # MATE
+        gs org.mate.screensaver idle-activation-enabled false
+        gs org.mate.screensaver lock-enabled false
+        gs org.mate.power-manager sleep-display-ac 0
+        gs org.mate.session idle-delay 0
+        gs org.mate.background picture-options zoom
+        gs org.mate.background picture-filename "$BG_IMAGE"
+        APPLIED="${APPLIED:+$APPLIED, }MATE"
+    fi
+    if has_schema org.gnome.desktop.background; then                         # GNOME (also present on Cinnamon)
+        gs org.gnome.desktop.background picture-options zoom
+        gs org.gnome.desktop.background picture-uri "file://$BG_IMAGE"
+        [ -z "$APPLIED" ] && APPLIED="GNOME"
+    fi
+
+    # Bigger desktop icons and labels
+    if has_schema org.nemo.icon-view; then                                   # Cinnamon's nemo-desktop
+        gs org.nemo.icon-view default-zoom-level "$DESKTOP_ICON_ZOOM"
+        FONT=$(gsettings get org.nemo.desktop font 2>/dev/null | sed -E "s/ [0-9]+'\$/ $DESKTOP_FONT_SIZE'/")
+        [ -n "$FONT" ] && gs org.nemo.desktop font "$FONT"
+        set_nemo_desktop_zoom
+        if pgrep -x nemo-desktop >/dev/null 2>&1; then
+            pkill -x nemo-desktop
+            sleep 1
+            (setsid nemo-desktop >/dev/null 2>&1 &)
+        fi
+        note "Desktop icons:      $DESKTOP_ICON_ZOOM, label font size $DESKTOP_FONT_SIZE"
+    elif has_schema org.mate.caja.icon-view; then                            # MATE's caja
+        gs org.mate.caja.icon-view default-zoom-level "$DESKTOP_ICON_ZOOM"
+        FONT=$(gsettings get org.mate.caja.desktop font 2>/dev/null | sed -E "s/ [0-9]+'\$/ $DESKTOP_FONT_SIZE'/")
+        [ -n "$FONT" ] && gs org.mate.caja.desktop font "$FONT"
+        note "Desktop icons:      $DESKTOP_ICON_ZOOM, label font size $DESKTOP_FONT_SIZE (log out and in to apply)"
+    fi
+
+    # Check that the background really took
+    BG_NOW=""
+    if has_schema org.cinnamon.desktop.background; then
+        BG_NOW=$(gsettings get org.cinnamon.desktop.background picture-uri 2>/dev/null)
+    elif has_schema org.mate.background; then
+        BG_NOW=$(gsettings get org.mate.background picture-filename 2>/dev/null)
+    elif has_schema org.gnome.desktop.background; then
+        BG_NOW=$(gsettings get org.gnome.desktop.background picture-uri 2>/dev/null)
+    fi
+    if [ -z "$APPLIED" ]; then
+        note "Desktop settings:   no Cinnamon, MATE or GNOME settings found; nothing applied"
+    elif [ ! -f "$BG_IMAGE" ]; then
+        note "Desktop settings:   applied ($APPLIED) but $BG_IMAGE is missing"
+    elif [[ "$BG_NOW" == *ifl-desktop-bg.png* ]]; then
+        note "Desktop settings:   applied ($APPLIED); background is $BG_IMAGE"
+    else
+        note "Desktop settings:   applied ($APPLIED) but the background did not take (reads ${BG_NOW:-nothing}); run this script from a terminal inside the desktop session"
+    fi
 else
     note "Desktop settings:   skipped"
 fi
