@@ -83,6 +83,7 @@ Phases 1 and 2 share one RawKinectViewer window. The wizard:
   height colors follow the new plane at once (`heightMapPlane` on the control pipe); corner changes
   need a sandbox restart, which the screen offers.
 
+The wizard needs only Python 3.6 or later with Tk (Mint 19.3 ships 3.6).
 Everything is logged to `etc/SARndbox-2.8/calibration.log`. Run
 `python3 bin/CalibrateSandbox.py --check` to print the paths the wizard uses.
 

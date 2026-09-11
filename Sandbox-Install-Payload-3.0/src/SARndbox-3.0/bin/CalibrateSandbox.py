@@ -15,6 +15,8 @@ ProjectorMatrix.dat itself; the wizard only checks that it did.
 
 Phases 1 and 2 share one RawKinectViewer session when both are selected.
 
+Runs on Python 3.6 and later (Linux Mint 19.3 ships 3.6), standard library only.
+
 Paths can be overridden with environment variables (used for testing):
   SANDBOX_CALIB_SARNDBOX_DIR        default ~/src/SARndbox-2.8
   SANDBOX_CALIB_ETC_DIR             default <sarndbox>/etc/SARndbox-2.8
@@ -316,7 +318,8 @@ class State:
 def detect_resolution(default=(1024, 768)):
     """Read the current screen mode from xrandr. Returns (w, h)."""
     try:
-        out = subprocess.run(["xrandr", "--current"], capture_output=True, text=True, timeout=5).stdout
+        out = subprocess.run(["xrandr", "--current"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return default
     for line in out.splitlines():
@@ -331,7 +334,8 @@ def detect_resolution(default=(1024, 768)):
 
 def sandbox_pids(process_name):
     try:
-        out = subprocess.run(["pgrep", "-x", process_name], capture_output=True, text=True, timeout=5).stdout
+        out = subprocess.run(["pgrep", "-x", process_name], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     return [int(p) for p in out.split() if p.isdigit()]
@@ -396,7 +400,7 @@ class ToolRunner:
         self.eof = False
         log.write("Running: %s" % " ".join(argv))
         self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                     stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1,
                                      start_new_session=True)
         threading.Thread(target=self._reader, daemon=True).start()
 
