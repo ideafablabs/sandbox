@@ -207,6 +207,27 @@ def dist(a, b):
     return sum((a[i] - b[i]) ** 2 for i in range(3)) ** 0.5
 
 
+def corner_issue(corners, plane=None):
+    """One short sentence about the most important problem with 4 corners, or None.
+    Kept short because Vrui wraps popup text at about 40 characters."""
+    if len(corners) != 4:
+        return None
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if dist(corners[i], corners[j]) < 5.0:
+                return "%s and %s are almost the same point." % (CORNER_NAMES[i], CORNER_NAMES[j])
+    ll, lr, ul, ur = corners
+    if not (ll[0] < lr[0] and ul[0] < ur[0] and ll[1] < ul[1] and lr[1] < ur[1]):
+        return "the order does not look like lower-left, lower-right, upper-left, upper-right."
+    if plane is not None:
+        nx, ny, nz, off = plane
+        for name, c in zip(CORNER_NAMES, corners):
+            height = c[0] * nx + c[1] * ny + c[2] * nz - off
+            if abs(height) > 30.0:
+                return "%s is %.0f cm off the base plane." % (name, abs(height))
+    return None
+
+
 def auto_order_corners(corners):
     """Sort 4 points into LL, LR, UL, UR using camera-space x (right) and y (up)."""
     pts = sorted(corners, key=lambda p: p[1])
@@ -588,6 +609,10 @@ class Session:
         self.error = None
         self.status = "Starting..."
 
+    def reminder(self):
+        """Instructions for where the user is right now (the 'Send instructions again' button)."""
+        return self.initial_message()
+
     def explain_error(self, text):
         t = text.lower()
         if "fewer than" in t or "not found" in t or "no such device" in t:
@@ -611,7 +636,6 @@ class KinectSession(Session):
         self.points = []
         self.serial = None
         self._phase2_prompted = False
-        self._corners_prompted = False
 
     def title(self):
         if self.phases == (1, 2):
@@ -643,6 +667,9 @@ class KinectSession(Session):
                              "Point at each corner of the sand surface in the LEFT image and press the 2 key, "
                              "in this order:\n"
                              "      lower-left \u2192 lower-right \u2192 upper-left \u2192 upper-right\n"
+                             "A popup confirms each corner and names the next one. No popup? The camera has no "
+                             "depth reading at that pixel (it shows black): move a little further onto the sand "
+                             "and press 2 again.\n"
                              "Misclicked? Keep going: the last 4 clicks count."))
         sections.append(("When you are done", "Press Esc to close RawKinectViewer and come back here."))
         return sections
@@ -656,9 +683,53 @@ class KinectSession(Session):
                     "Wait for the capture. Then hold key 1 and drag a box over flat sand in the LEFT image.")
         return self._corner_prompt("PHASE 2 - CORNERS: ")
 
+    NO_POPUP_HINT = ("No popup? The camera has no depth at that pixel (it shows black): move a bit "
+                     "further onto the sand and press 2 again.")
+    ALL_DONE = ("Press Esc to finish, or start again from the lower-left corner: the last 4 count.")
+
     def _corner_prompt(self, prefix):
-        return (prefix + "press key 2 on each corner of the sand in the LEFT image: lower-left, "
-                "lower-right, upper-left, upper-right.")
+        return (prefix + "press key 2 on each corner of the sand in the LEFT image, starting "
+                "LOWER-LEFT, then lower-right, upper-left, upper-right. A popup confirms each "
+                "corner and names the next one. " + self.NO_POPUP_HINT)
+
+    def corner_message(self):
+        """Popup text after the corner press that was just parsed."""
+        n = len(self.points)
+        i = (n - 1) % 4
+        got = "Corner %d of 4 (%s) captured at %s." % (i + 1, CORNER_NAMES[i], short_point(self.points[-1]))
+        if n > 4 and i == 0:
+            got = "Starting over. " + got
+        if i < 3:
+            return "%s NEXT: press 2 on the %s corner." % (got, CORNER_NAMES[i + 1].upper())
+        issue = corner_issue(self.corners(), self.plane)
+        if issue:
+            return "%s All 4 corners done, but check this: %s %s" % (got, issue, self.ALL_DONE)
+        return "%s All 4 corners done. %s" % (got, self.ALL_DONE)
+
+    def _corner_status(self):
+        n = len(self.points)
+        i = (n - 1) % 4
+        if i < 3:
+            return "Corner %d of 4 (%s) captured. Next: %s" % (i + 1, CORNER_NAMES[i], CORNER_NAMES[i + 1])
+        issue = corner_issue(self.corners(), self.plane)
+        text = "All 4 corners captured. Press Esc in RawKinectViewer to finish."
+        if issue:
+            text += " Check: " + issue
+        return text
+
+    def reminder(self):
+        if 1 in self.phases and self.plane is None:
+            return self.initial_message()
+        if 2 in self.phases:
+            n = len(self.points)
+            if n == 0:
+                return self._corner_prompt("PHASE 2 - CORNERS: ")
+            if n % 4:
+                return ("%d of 4 corners so far. NEXT: press 2 on the %s corner. %s"
+                        % (n % 4, CORNER_NAMES[n % 4].upper(), self.NO_POPUP_HINT))
+            return "All 4 corners captured. " + self.ALL_DONE
+        return ("Base plane captured (offset %.1f cm). Press Esc to finish, or hold key 1 and drag "
+                "again to redo: the last one counts." % self.plane[3])
 
     def on_line(self, line):
         """Return a message to show inside the tool window, or None."""
@@ -693,15 +764,12 @@ class KinectSession(Session):
         point = parse_point_line(line)
         if point is not None:
             self.points.append(point)
-            n = len(self.points)
-            self.status = "%d corner click%s so far" % (n, "" if n == 1 else "s")
-            if 2 in self.phases and n >= 4 and not self._corners_prompted:
-                self._corners_prompted = True
-                return ("4 corners captured. Press Esc to finish, or click again to redo. "
-                        "The last 4 clicks count.")
-            if 2 in self.phases and n > 4 and (n - 4) % 4 == 0:
-                return "Another 4 corners captured. Press Esc to finish."
-            return None
+            if 2 not in self.phases:
+                n = len(self.points)
+                self.status = "%d corner click%s so far (not part of this phase)" % (n, "" if n == 1 else "s")
+                return None
+            self.status = self._corner_status()
+            return self.corner_message()
         return None
 
     def corners(self):
@@ -763,6 +831,15 @@ class ProjectorSession(Session):
     def initial_message(self):
         return ("PHASE 3 - PROJECTOR: hold the disk where the white cross is and press key 1. "
                 "Repeat for all %d points. Press key 2 after changing the sand." % NUM_TIE_POINTS)
+
+    def reminder(self):
+        if self.rms is not None:
+            return ("Calibration done. Move the disk around: the red circle should follow it. "
+                    "Press Esc to finish.")
+        if self.tie_points == 0:
+            return self.initial_message()
+        return ("%d of %d points captured. Hold the disk where the white cross is and press key 1 "
+                "for the next one. Press key 2 after changing the sand." % (self.tie_points, NUM_TIE_POINTS))
 
     def on_line(self, line):
         m = EXCEPTION_RE.search(line)
@@ -1621,7 +1698,7 @@ def build_app(paths, log=None, state=None):
             ttk.Button(buttons, text="Stop the tool now", style="Danger.TButton",
                        command=self.stop_tool_clicked).pack(side="left")
             ttk.Button(buttons, text="Send instructions again", style="Secondary.TButton",
-                       command=lambda: self.runner and self.runner.show_message(session.initial_message())).pack(
+                       command=lambda: self.runner and self.runner.show_message(session.reminder())).pack(
                 side="left", padx=(10, 0))
             inner = self.card(self.body, padx=18, pady=14)
             self.pulse_canvas = tk.Canvas(inner, width=22, height=22, bg=C["card"], highlightthickness=0)

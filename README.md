@@ -77,7 +77,12 @@ UC Davis calibration steps into one window with three phases:
 Phases 1 and 2 share one RawKinectViewer window. The wizard:
 
 - shows which phases are done and the current values, and lets you tick which phases to run;
-- sends instructions into the tool window (Vrui `showMessage` on stdin) as each step is reached;
+- sends instructions into the tool window (Vrui `showMessage` on stdin) as each step is reached.
+  In phase 2 every corner press gets a popup that confirms the corner, shows its position and
+  names the next corner; the fourth one also flags a suspicious set (wrong order, duplicate,
+  far from the base plane). No popup after pressing `2` means the camera has no depth reading
+  at that pixel (black in the depth image), so the tool printed nothing: move further onto
+  the sand and press again. "Send instructions again" repeats the hint for the current step;
 - reads the values the tools print, uses the last plane and the last four corner clicks, checks them
   (negative offset, corner order, distance from the plane) and offers redo or auto-order;
 - backs up `BoxLayout.txt` and `ProjectorMatrix.dat` into `etc/SARndbox-2.8/backups/` before writing;
