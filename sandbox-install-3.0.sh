@@ -184,6 +184,23 @@ else
     mkfifo "$FIFO" && note "Control.fifo:       created"
 fi
 
+# ---------------------------------------------------------------------- SandboxHelper plugin
+# A small Vrui plugin (vislet) the wizard loads into RawKinectViewer so it can switch on
+# "Average Frames" by itself and replace its popups. Built against the installed Vrui.
+VISLET_SRC=$SANDBOX_DIR/SandboxHelper
+VRUI_MAKEINCLUDE=/usr/local/share/Vrui-8.0/Vrui.makeinclude
+if [ -f "$VISLET_SRC/SandboxHelper.cpp" ] && [ -f "$VRUI_MAKEINCLUDE" ]; then
+    say "Building the SandboxHelper plugin (lets the wizard switch on Average Frames by itself)"
+    if make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" && sudo make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" install; then
+        note "SandboxHelper:      built and installed"
+    else
+        echo "WARNING: the SandboxHelper plugin did not build; the wizard falls back to picking Average Frames by hand" >&2
+        note "SandboxHelper:      NOT installed (build failed, see above)"
+    fi
+else
+    note "SandboxHelper:      skipped (Vrui makefile fragment or plugin source not found)"
+fi
+
 # ---------------------------------------------------------------------- desktop settings
 # Background picture, no screensaver / display sleep, sound off, bigger desktop icons.
 # DESKTOP_ICON_ZOOM: smallest smaller small standard large larger largest (--icon-zoom)

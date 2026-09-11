@@ -70,7 +70,7 @@ running an update on a sandbox PC.
 `bin/CalibrateSandbox.py` (started by `bin/CalibrateSandbox.sh`) wraps the three
 UC Davis calibration steps into one window with three phases:
 
-1. **Base plane** - RawKinectViewer, "Average Frames" then key `1` to drag a box over flat sand.
+1. **Base plane** - RawKinectViewer, "Average Frames" (pressed by the SandboxHelper plugin, see below) then key `1` to drag a box over flat sand.
 2. **Box corners** - RawKinectViewer, key `2` on the four corners (lower-left, lower-right, upper-left, upper-right).
 3. **Projector** - CalibrateProjector with the calibration disk, key `1` per point, key `2` to re-capture the background.
 
@@ -105,6 +105,20 @@ projector output with `xrandr`, so the wizard switches back to the normal
 orientation by itself whenever it starts RawKinectViewer, CalibrateProjector,
 XBackground or the sandbox, flips again when they exit, and restores the
 original orientation when it quits (the launcher script double-checks this).
+
+**SandboxHelper plugin.** RawKinectViewer has no command-line switch for
+"Average Frames", and the plane tool needs it. `SandboxHelper/` is a small Vrui
+plugin (a "vislet", built by the install script against the installed Vrui and
+put into Vrui's `VRVislets` directory) that the wizard loads into the tools with
+`-vislet SandboxHelper ;`. It adds three console commands on stdin:
+`sandboxAverage on|off` presses the Average Frames menu entry and prints
+`SandboxHelper: average frame ready` when the capture dialog has gone,
+`sandboxMessage <text>` replaces the open popups with a new one instead of
+stacking them, and `sandboxCloseMessages`. With the plugin the wizard captures
+the flat sand by itself as soon as the camera connects, tells the operator when
+to start dragging, and offers "Capture the sand again" on the running screen.
+Without it (build failed, or `SANDBOX_CALIB_VISLET=none`) the wizard falls back
+to the manual right-click instructions. The UC Davis code is not touched.
 
 The wizard needs only Python 3.6 or later with Tk (Mint 19.3 ships 3.6).
 Everything is logged to `etc/SARndbox-2.8/calibration.log`. Run

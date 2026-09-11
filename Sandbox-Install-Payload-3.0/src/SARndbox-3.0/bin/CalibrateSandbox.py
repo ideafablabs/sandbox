@@ -30,6 +30,7 @@ Paths can be overridden with environment variables (used for testing):
 
 import argparse
 import datetime
+import glob
 import json
 import os
 import queue
@@ -43,6 +44,7 @@ import time
 APP_TITLE = "Calibrate Sandbox"
 HOME = os.path.expanduser("~")
 NUM_TIE_POINTS = 12  # CalibrateProjector default grid 4 x 3
+HELPER_TIMEOUT = 10  # seconds to wait for the SandboxHelper plugin to report before falling back
 
 
 # --------------------------------------------------------------------------
@@ -65,6 +67,19 @@ class Paths:
         self.sandbox_process = env("SANDBOX_CALIB_SANDBOX_PROCESS", "SARndbox")
         self.control_fifo = env("SANDBOX_CALIB_CONTROL_FIFO",
                                 os.path.join(self.sarndbox_dir, "share", "SARndbox-2.8", "Control.fifo"))
+        # SandboxHelper: our Vrui plugin (../SandboxHelper/) that lets the wizard press "Average Frames"
+        # and replace popups inside the tools. Empty when it is not installed.
+        self.vislet = env("SANDBOX_CALIB_VISLET", "")
+        if self.vislet.lower() in ("none", "off"):
+            self.vislet = ""
+        elif not self.vislet:
+            for pattern in ("/usr/local/lib/*/Vrui-8.0/VRVislets/libSandboxHelper.so",
+                            "/usr/local/lib/Vrui-8.0/VRVislets/libSandboxHelper.so",
+                            "/usr/local/lib64/Vrui-8.0/VRVislets/libSandboxHelper.so"):
+                hits = glob.glob(pattern)
+                if hits:
+                    self.vislet = hits[0]
+                    break
         self.box_layout = os.path.join(self.etc_dir, "BoxLayout.txt")
         self.sandbox_cfg = os.path.join(self.etc_dir, "SARndbox.cfg")
         self.box_layout_orig = self.box_layout + ".orig"
@@ -88,6 +103,7 @@ class Paths:
             ("SARndbox.cfg", self.sandbox_cfg, os.path.isfile(self.sandbox_cfg)),
             ("ProjectorMatrix.dat", self.projector_matrix, os.path.isfile(self.projector_matrix)),
             ("Control.fifo", self.control_fifo, os.path.exists(self.control_fifo)),
+            ("SandboxHelper plugin", self.vislet or "not installed: Average Frames is picked by hand", True),
         ]
         output, rotation = detect_display()
         items.append(("Display (xrandr)", "%s, rotation %s" % (output, rotation), output is not None))
@@ -137,6 +153,9 @@ CALIB_ERROR_RE = re.compile(r"Calibration error:\s*(.*)")
 CONNECTED_RE = re.compile(r"Connected to 3D camera with serial number\s*(\S+)")
 EXCEPTION_RE = re.compile(r"Terminated \w+ due to exception:\s*(.*)")
 
+HELPER_LOADED_RE = re.compile(r"^SandboxHelper: loaded")
+HELPER_IGNORED_RE = re.compile(r"Ignoring vislet of type SandboxHelper")
+HELPER_AVERAGE_RE = re.compile(r"^SandboxHelper: (Average Frames on, capturing|average frame ready|Average Frames off|error: .*)")
 CORNER_NAMES = ("lower-left", "lower-right", "upper-left", "upper-right")
 
 
@@ -549,6 +568,7 @@ class ToolRunner:
         self.log = log
         self.lines = queue.Queue()
         self.eof = False
+        self.helper = False  # set once the SandboxHelper plugin reports itself loaded
         log.write("Running: %s" % " ".join(argv))
         self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1,
@@ -573,7 +593,9 @@ class ToolRunner:
             pass
 
     def show_message(self, text):
-        self.send("showMessage " + text)
+        """Pop a message up in the tool window. With the SandboxHelper plugin loaded the new
+        popup replaces the previous one instead of stacking on top of it."""
+        self.send(("sandboxMessage " if self.helper else "showMessage ") + text)
 
     def running(self):
         return self.proc.poll() is None
@@ -605,9 +627,39 @@ class Session:
     tool_name = ""
     phases = ()
 
-    def __init__(self):
+    def __init__(self, helper_expected=False):
         self.error = None
         self.status = "Starting..."
+        self.helper_expected = helper_expected  # the SandboxHelper plugin is installed and gets loaded
+        self.helper = False                     # ...and has reported itself loaded
+        self.helper_failed = False
+        self.awaiting_helper_since = None       # set when the first popup waits for the plugin's report
+        self.commands = []                      # console commands for the tool, sent by the App
+
+    def vislet_args(self, paths):
+        return ["-vislet", "SandboxHelper", ";"] if getattr(paths, "vislet", "") else []
+
+    def take_commands(self):
+        commands, self.commands = self.commands, []
+        return commands
+
+    def helper_line(self, line):
+        """Handle the plugin's load/failure lines. Returns (handled, message)."""
+        if HELPER_LOADED_RE.search(line):
+            self.helper = True
+            return True, self.on_helper_loaded()
+        if HELPER_IGNORED_RE.search(line):
+            self.helper_failed = True
+            return True, self.on_helper_failed()
+        return False, None
+
+    def on_helper_loaded(self):
+        """The plugin is in: show the first instructions through it."""
+        return self.initial_message()
+
+    def on_helper_failed(self):
+        """No plugin after all: show the first instructions the plain Vrui way."""
+        return self.initial_message()
 
     def reminder(self):
         """Instructions for where the user is right now (the 'Send instructions again' button)."""
@@ -627,9 +679,13 @@ class Session:
 class KinectSession(Session):
     tool_name = "RawKinectViewer"
 
-    def __init__(self, phases):
-        Session.__init__(self)
+    def __init__(self, phases, helper_expected=False):
+        Session.__init__(self, helper_expected)
         self.phases = tuple(sorted(set(phases)))
+        self.connected = False
+        self.averaging = False      # the plugin is capturing the average depth frame
+        self.average_ready = False
+        self.captures = 0
         self.plane = None
         self.plane_rms = None
         self.plane_flipped = False
@@ -645,7 +701,7 @@ class KinectSession(Session):
         return "Phase 2: box corners"
 
     def argv(self, paths):
-        return [paths.raw_kinect_viewer, "-compress", "0"]
+        return [paths.raw_kinect_viewer, "-compress", "0"] + self.vislet_args(paths)
 
     def intro_sections(self):
         """List of (heading, text). The last entry is shown as the closing note."""
@@ -655,7 +711,16 @@ class KinectSession(Session):
                      "\u2022 RawKinectViewer opens full screen. Work in the LEFT half (the depth image) "
                      "and ignore the RIGHT half (the color camera).\n"
                      "\u2022 Instructions pop up inside that window as you go. Click 'Jolly Good!' to dismiss them.")]
-        if 1 in self.phases:
+        if 1 in self.phases and self.helper_expected:
+            sections.append(("Phase 1 \u00b7 Base plane",
+                             "1. The wizard captures the flat sand by itself right after the window opens "
+                             "('Capturing average depth frame...' shows for about 5 seconds). Keep hands out "
+                             "until the popup says the sand is captured.\n"
+                             "2. Hold down the 1 key and drag a rectangle over a large, flat area of sand in the "
+                             "LEFT image, then release the key. Stay inside the sand.\n"
+                             "Not happy? Drag again: the last rectangle counts. Touched the sand? Click "
+                             "'Capture the sand again' in this window first."))
+        elif 1 in self.phases:
             sections.append(("Phase 1 \u00b7 Base plane",
                              "1. Press and hold the RIGHT mouse button, move onto 'Average Frames' in the menu "
                              "that pops up, and release. Wait until 'Capturing average depth frame...' disappears.\n"
@@ -677,11 +742,54 @@ class KinectSession(Session):
     def intro_text(self, ctx=None):
         return "\n\n".join("%s\n%s" % sec for sec in self.intro_sections())
 
+    DRAG_PROMPT = ("Hold down key 1 and drag a box over a large, flat area of sand in the LEFT image, "
+                   "then release the key.")
+
     def initial_message(self):
+        if self.helper_expected:
+            phase = "PHASE 1 - BASE PLANE" if 1 in self.phases else "PHASE 2 - CORNERS"
+            return ("%s: starting up. The flat sand is captured automatically in a moment: keep "
+                    "hands and tools out of the box." % phase)
+        return self.manual_message()
+
+    def manual_message(self):
+        """Instructions for the case without the SandboxHelper plugin."""
         if 1 in self.phases:
             return ("PHASE 1 - BASE PLANE: hold the right mouse button, pick Average Frames, release. "
                     "Wait for the capture. Then hold key 1 and drag a box over flat sand in the LEFT image.")
         return self._corner_prompt("PHASE 2 - CORNERS: ")
+
+    def request_average(self):
+        """Ask the plugin to (re)capture the average depth frame. Returns the popup text."""
+        self.commands.append("sandboxAverage on")
+        self.averaging = True
+        self.average_ready = False
+        self.captures += 1
+        self.status = "Capturing the flat sand (about 5 seconds)..."
+        again = "again " if self.captures > 1 else ""
+        return ("Capturing the flat sand %sfor about 5 seconds. Keep hands and tools out of the box."
+                % again)
+
+    def on_helper_loaded(self):
+        if self.connected:
+            return self.request_average()
+        return self.initial_message()
+
+    def on_helper_failed(self):
+        self.status = "The SandboxHelper plugin did not load: pick Average Frames by hand."
+        return self.manual_message()
+
+    def after_average(self):
+        """Popup text once the plugin reports the average frame."""
+        self.averaging = False
+        self.average_ready = True
+        self.status = "Sand captured. Waiting for you..."
+        if 1 in self.phases and self.plane is None:
+            return "Sand captured. " + self.DRAG_PROMPT
+        if 1 in self.phases:
+            return ("Sand captured again. Drag again with key 1 to redo the base plane (the last one "
+                    "counts), or carry on.")
+        return self._corner_prompt("Sand captured. PHASE 2 - CORNERS: ")
 
     NO_POPUP_HINT = ("No popup? The camera has no depth at that pixel (it shows black): move a bit "
                      "further onto the sand and press 2 again.")
@@ -718,8 +826,12 @@ class KinectSession(Session):
         return text
 
     def reminder(self):
+        if self.helper and self.averaging:
+            return "Capturing the flat sand: keep hands and tools out of the box for a few seconds."
         if 1 in self.phases and self.plane is None:
-            return self.initial_message()
+            if self.helper and self.average_ready:
+                return "Sand captured. " + self.DRAG_PROMPT
+            return self.manual_message() if (self.helper_failed or not self.helper_expected) else self.initial_message()
         if 2 in self.phases:
             n = len(self.points)
             if n == 0:
@@ -733,10 +845,29 @@ class KinectSession(Session):
 
     def on_line(self, line):
         """Return a message to show inside the tool window, or None."""
+        handled, message = self.helper_line(line)
+        if handled:
+            return message
+        m = HELPER_AVERAGE_RE.search(line)
+        if m:
+            what = m.group(1)
+            if what.startswith("average frame ready"):
+                return self.after_average()
+            if what.startswith("error"):
+                self.averaging = False
+                self.status = "The plugin could not press Average Frames: pick it by hand."
+                return self.manual_message()
+            if what == "Average Frames off":
+                self.averaging = False
+                self.average_ready = False
+            return None
         m = CONNECTED_RE.search(line)
         if m:
             self.serial = m.group(1)
+            self.connected = True
             self.status = "Camera %s connected. Waiting for you..." % self.serial
+            if self.helper:
+                return self.request_average()
             return None
         m = EXCEPTION_RE.search(line)
         if m:
@@ -788,8 +919,8 @@ class ProjectorSession(Session):
     tool_name = "CalibrateProjector"
     phases = (3,)
 
-    def __init__(self, width, height):
-        Session.__init__(self)
+    def __init__(self, width, height, helper_expected=False):
+        Session.__init__(self, helper_expected)
         self.width = width
         self.height = height
         self.tie_points = 0
@@ -801,8 +932,8 @@ class ProjectorSession(Session):
         return "Phase 3: projector calibration"
 
     def argv(self, paths):
-        return [paths.calibrate_projector, "-s", str(self.width), str(self.height),
-                "-slf", paths.box_layout, "-pmf", paths.projector_matrix]
+        return ([paths.calibrate_projector, "-s", str(self.width), str(self.height),
+                 "-slf", paths.box_layout, "-pmf", paths.projector_matrix] + self.vislet_args(paths))
 
     def intro_sections(self):
         return [("Get ready",
@@ -822,8 +953,8 @@ class ProjectorSession(Session):
                  "your hands out and press the 2 key to re-capture the background (the screen flashes red). "
                  "A red screen right after pressing 1 means you pressed the wrong key."),
                 ("After the last point",
-                 "The calibration is computed and saved automatically. Move the disk around: a red circle "
-                 "should follow it. Press Esc to finish.")]
+                 "The calibration is computed and saved automatically. Move the disk around: a red crosshair (two lines "
+                 "across the whole screen) should meet at its center. Press Esc to finish.")]
 
     def intro_text(self, ctx=None):
         return "\n\n".join("%s\n%s" % sec for sec in self.intro_sections())
@@ -834,7 +965,7 @@ class ProjectorSession(Session):
 
     def reminder(self):
         if self.rms is not None:
-            return ("Calibration done. Move the disk around: the red circle should follow it. "
+            return ("Calibration done. Move the disk around: the red crosshair should follow it. "
                     "Press Esc to finish.")
         if self.tie_points == 0:
             return self.initial_message()
@@ -842,6 +973,9 @@ class ProjectorSession(Session):
                 "for the next one. Press key 2 after changing the sand." % (self.tie_points, NUM_TIE_POINTS))
 
     def on_line(self, line):
+        handled, message = self.helper_line(line)
+        if handled:
+            return message
         m = EXCEPTION_RE.search(line)
         if m:
             self.error = m.group(1)
@@ -861,7 +995,7 @@ class ProjectorSession(Session):
             self.rms = float(m.group(1))
             self.status = "Calibration computed. RMS residual %.2f pixels." % self.rms
             return ("Calibration done. RMS residual %.2f pixels. Move the disk around: the red "
-                    "circle should follow it. Press Esc to finish." % self.rms)
+                    "crosshair should follow it. Press Esc to finish." % self.rms)
         m = CALIB_ERROR_RE.search(line)
         if m:
             self.calib_error = m.group(1).strip()
@@ -1566,12 +1700,12 @@ def build_app(paths, log=None, state=None):
                 return
             if self.queue[:2] == [1, 2]:
                 self.queue = self.queue[2:]
-                session = KinectSession((1, 2))
+                session = KinectSession((1, 2), bool(paths.vislet))
             elif self.queue[0] in (1, 2):
-                session = KinectSession((self.queue.pop(0),))
+                session = KinectSession((self.queue.pop(0),), bool(paths.vislet))
             else:
                 self.queue.pop(0)
-                session = ProjectorSession(*self.resolution)
+                session = ProjectorSession(self.resolution[0], self.resolution[1], bool(paths.vislet))
             self.show_intro(session)
 
         def show_intro(self, session):
@@ -1677,13 +1811,20 @@ def build_app(paths, log=None, state=None):
                     messagebox.showerror(APP_TITLE, "The sandbox process could not be stopped.")
                     return
             argv = session.argv(paths)
+            log.write("SandboxHelper plugin: %s" % (paths.vislet or "not installed"))
             self.apply_flip(tool_starting=True)
             try:
                 self.runner = ToolRunner(argv, paths.sarndbox_dir, log)
             except OSError as e:
                 messagebox.showerror(APP_TITLE, "Could not start %s:\n%s\n\n%s" % (session.tool_name, argv[0], e))
                 return
-            self.runner.show_message(session.initial_message())
+            if paths.vislet:
+                # The plugin reports "SandboxHelper: loaded" (or Vrui reports it missing) within a
+                # second; the first popup is sent then, through the plugin, so no Vrui-native popup
+                # is ever created. _poll falls back to plain Vrui messages if neither line shows up.
+                session.awaiting_helper_since = time.time()
+            else:
+                self.runner.show_message(session.initial_message())
             self.show_running()
 
         def show_running(self):
@@ -1700,6 +1841,12 @@ def build_app(paths, log=None, state=None):
             ttk.Button(buttons, text="Send instructions again", style="Secondary.TButton",
                        command=lambda: self.runner and self.runner.show_message(session.reminder())).pack(
                 side="left", padx=(10, 0))
+            self.recapture_btn = None
+            if isinstance(session, KinectSession):
+                self.recapture_btn = ttk.Button(buttons, text="Capture the sand again", style="Secondary.TButton",
+                                                command=self.recapture_average)
+                self.recapture_btn.pack(side="left", padx=(10, 0))
+                self.recapture_btn.state(["disabled"])
             inner = self.card(self.body, padx=18, pady=14)
             self.pulse_canvas = tk.Canvas(inner, width=22, height=22, bg=C["card"], highlightthickness=0)
             self.pulse_canvas.pack(side="left", padx=(0, 12))
@@ -1724,6 +1871,35 @@ def build_app(paths, log=None, state=None):
             if self.runner is not None:
                 self.runner.stop()
 
+        def flush_commands(self):
+            """Send the console commands a session queued (e.g. sandboxAverage on)."""
+            runner, session = self.runner, self.session
+            if runner is None or session is None:
+                return
+            if session.helper:
+                runner.helper = True
+            for command in session.take_commands():
+                runner.send(command)
+
+        def recapture_average(self):
+            session, runner = self.session, self.runner
+            if runner is None or not isinstance(session, KinectSession) or not session.helper:
+                return
+            message = session.request_average()
+            self.flush_commands()
+            runner.show_message(message)
+            self.refresh_running_widgets()
+
+        def refresh_running_widgets(self):
+            session = self.session
+            lbl = getattr(self, "status_label", None)
+            if lbl is not None and lbl.winfo_exists() and session is not None:
+                lbl.configure(text=session.status)
+            btn = getattr(self, "recapture_btn", None)
+            if btn is not None and btn.winfo_exists() and session is not None:
+                ready = getattr(session, "helper", False) and not getattr(session, "averaging", False)
+                btn.state(["!disabled"] if ready else ["disabled"])
+
         def _poll(self):
             runner = self.runner
             if runner is not None:
@@ -1738,11 +1914,20 @@ def build_app(paths, log=None, state=None):
                         break
                     log.write("%s: %s" % (self.session.tool_name, line))
                     message = self.session.on_line(line)
+                    self.flush_commands()
                     if message:
                         runner.show_message(message)
-                    lbl = getattr(self, "status_label", None)
-                    if lbl is not None and lbl.winfo_exists():
-                        lbl.configure(text=self.session.status)
+                    self.refresh_running_widgets()
+                s = self.session
+                if (s.awaiting_helper_since and not s.helper and not s.helper_failed
+                        and time.time() - s.awaiting_helper_since > HELPER_TIMEOUT):
+                    s.helper_failed = True
+                    log.write("The SandboxHelper plugin did not report within %d s; using plain Vrui messages"
+                              % HELPER_TIMEOUT)
+                    message = s.on_helper_failed()
+                    if message:
+                        runner.show_message(message)
+                    self.refresh_running_widgets()
                 if finished:
                     rc = runner.proc.wait()
                     log.write("%s exited with code %s" % (self.session.tool_name, rc))
@@ -1830,7 +2015,7 @@ def build_app(paths, log=None, state=None):
                 ttk.Button(buttons, text="Auto-order corners", style="Secondary.TButton",
                            command=self.auto_order_clicked).pack(side="left", padx=(10, 0))
             ttk.Button(buttons, text="Redo this step", style="Secondary.TButton",
-                       command=lambda: self.show_intro(KinectSession(s.phases))).pack(side="left", padx=(10, 0))
+                       command=lambda: self.show_intro(KinectSession(s.phases, bool(paths.vislet)))).pack(side="left", padx=(10, 0))
             ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
                        command=self.abort_to_hub).pack(side="right")
             tk.Frame(self.body, bg=C["bg"], height=14).pack()
@@ -1905,7 +2090,7 @@ def build_app(paths, log=None, state=None):
             if written and not problems:
                 ttk.Button(buttons, text="Continue", style="Primary.TButton", command=self.next_session).pack(side="left")
             ttk.Button(buttons, text="Redo this step", style="Secondary.TButton",
-                       command=lambda: self.show_intro(ProjectorSession(s.width, s.height))).pack(side="left", padx=(10, 0))
+                       command=lambda: self.show_intro(ProjectorSession(s.width, s.height, bool(paths.vislet)))).pack(side="left", padx=(10, 0))
             ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
                        command=self.abort_to_hub).pack(side="right")
             tk.Frame(self.body, bg=C["bg"], height=14).pack()
