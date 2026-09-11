@@ -151,7 +151,7 @@ tar xzf "$PAYLOAD" -C "$HOME" || die "could not unpack the payload"
 
 if [ -n "$BACKUP_DIR" ]; then
     KEPT=0
-    for f in src/SARndbox-2.8/etc/SARndbox-2.8/BoxLayout.txt src/SARndbox-2.8/etc/SARndbox-2.8/ProjectorMatrix.dat; do
+    for f in src/SARndbox-2.8/etc/SARndbox-2.8/BoxLayout.txt src/SARndbox-2.8/etc/SARndbox-2.8/ProjectorMatrix.dat src/SARndbox-2.8/etc/SARndbox-2.8/SARndbox.cfg; do
         if [ -f "$BACKUP_DIR/$f" ]; then
             cp -a "$BACKUP_DIR/$f" "$HOME/$f" && KEPT=$((KEPT + 1))
         fi

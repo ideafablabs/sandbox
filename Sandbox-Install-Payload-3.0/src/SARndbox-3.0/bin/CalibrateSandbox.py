@@ -66,6 +66,7 @@ class Paths:
         self.control_fifo = env("SANDBOX_CALIB_CONTROL_FIFO",
                                 os.path.join(self.sarndbox_dir, "share", "SARndbox-2.8", "Control.fifo"))
         self.box_layout = os.path.join(self.etc_dir, "BoxLayout.txt")
+        self.sandbox_cfg = os.path.join(self.etc_dir, "SARndbox.cfg")
         self.box_layout_orig = self.box_layout + ".orig"
         self.projector_matrix = os.path.join(self.etc_dir, "ProjectorMatrix.dat")
         self.projector_matrix_orig = self.projector_matrix + ".orig"
@@ -84,6 +85,7 @@ class Paths:
             ("run-sandbox.sh", self.run_sandbox, os.access(self.run_sandbox, os.X_OK)),
             ("BoxLayout.txt", self.box_layout, os.path.isfile(self.box_layout)),
             ("BoxLayout.txt.orig", self.box_layout_orig, os.path.isfile(self.box_layout_orig)),
+            ("SARndbox.cfg", self.sandbox_cfg, os.path.isfile(self.sandbox_cfg)),
             ("ProjectorMatrix.dat", self.projector_matrix, os.path.isfile(self.projector_matrix)),
             ("Control.fifo", self.control_fifo, os.path.exists(self.control_fifo)),
         ]
@@ -254,6 +256,98 @@ def write_box_layout(path, plane, corners):
     with open(tmp, "w") as f:
         f.write(text)
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# heightMapPlane in SARndbox.cfg: the plane the colour map is measured from.
+# SARndbox reads it at startup from "section SARndbox" and also accepts it live
+# on the control pipe. Keeping it a few cm above or below the base plane moves
+# the colour bands (sea level) without touching the camera calibration.
+# --------------------------------------------------------------------------
+
+HMP_TAG_RE = re.compile(r"^(\s*)heightMapPlane\b\s*(.*?)\s*$")
+SECTION_RE = re.compile(r"^\s*section\s+(\S+)\s*$")
+ENDSECTION_RE = re.compile(r"^\s*endsection\s*$")
+HMP_COMMENT = "# Colour map height (sea level), written by Calibrate Sandbox"
+DEFAULT_SANDBOX_CFG = """# Configuration file for SARndbox application
+section SARndbox
+\tsection Camera
+\t\t# Configuration parameters for Kinect v1
+\t\tcompressDepthFrames true
+\t\tsmoothDepthFrames false
+\tendsection
+endsection
+"""
+
+
+def _cfg_root_section(lines):
+    """Locate 'section SARndbox' at depth 0. Returns (start, end, tag_lines, comment_lines)."""
+    depth = 0
+    start = end = None
+    tags, comments = [], []
+    for i, line in enumerate(lines):
+        code = line.split("#", 1)[0]
+        if SECTION_RE.match(code):
+            if depth == 0 and SECTION_RE.match(code).group(1) == "SARndbox" and start is None:
+                start = i
+            depth += 1
+        elif ENDSECTION_RE.match(code):
+            depth -= 1
+            if depth == 0 and start is not None and end is None:
+                end = i
+        elif start is not None and end is None and depth == 1:
+            if HMP_TAG_RE.match(code):
+                tags.append(i)
+            elif line.strip() == HMP_COMMENT:
+                comments.append(i)
+    return start, end, tags, comments
+
+
+def read_height_map_plane(path):
+    """Return the heightMapPlane from SARndbox.cfg as (nx, ny, nz, off), or None."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    start, end, tags, comments = _cfg_root_section(lines)
+    if not tags:
+        return None
+    value = HMP_TAG_RE.match(lines[tags[-1]].split("#", 1)[0]).group(2)
+    m = LAYOUT_PLANE_RE.match(value)
+    if not m:
+        return None
+    return tuple(float(m.group(i)) for i in range(1, 5))
+
+
+def write_height_map_plane(path, plane):
+    """Set (plane given) or remove (plane None) the heightMapPlane tag in SARndbox.cfg.
+    Other settings and comments in the file are left untouched."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = DEFAULT_SANDBOX_CFG.splitlines()
+    start, end, tags, comments = _cfg_root_section(lines)
+    if start is None or end is None:
+        lines += ["section SARndbox", "endsection"]
+        start, end, tags, comments = _cfg_root_section(lines)
+    remove = sorted(tags + comments)
+    insert_at = remove[0] if remove else end
+    for i in reversed(remove):
+        del lines[i]
+    if plane is not None:
+        lines[insert_at:insert_at] = ["\t" + HMP_COMMENT, "\theightMapPlane " + format_plane(plane)]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def height_map_plane_for(base_plane, delta):
+    """The colour plane for a sea-level offset of `delta` cm above the base plane."""
+    nx, ny, nz, off = base_plane
+    return (nx, ny, nz, off + delta)
 
 
 def backup_file(path, backup_dir):
@@ -727,6 +821,8 @@ def build_app(paths, log=None, state=None):
             log.listeners.append(self._on_log_line)
             self.log_widget = None
             self.pulse_canvas = None
+            self._sandbox_bar_key = None
+            self._last_bar_refresh = 0.0
             self.resolution = detect_resolution()
             self.show_hub()
             self.after(200, self._poll)
@@ -745,6 +841,7 @@ def build_app(paths, log=None, state=None):
                 return tkfont.Font(family=ui, size=size, weight=weight)
 
             self.f_title = F(22, "bold")
+            self.f_display = F(34, "bold")
             self.f_h2 = F(15, "bold")
             self.f_body = F(12)
             self.f_body_b = F(12, "bold")
@@ -801,6 +898,12 @@ def build_app(paths, log=None, state=None):
                          insertcolor=C["text"], padding=(8, 6))
             st.map("TEntry", bordercolor=[("focus", C["accent"])], lightcolor=[("focus", C["accent"])],
                    darkcolor=[("focus", C["accent"])])
+            st.configure("Horizontal.TScale", background=C["accent"], troughcolor=C["border"],
+                         bordercolor=C["accent"], lightcolor=C["accent"], darkcolor=C["accent"],
+                         sliderlength=30, sliderthickness=22, gripcount=0)
+            st.map("Horizontal.TScale", background=[("active", C["accent_hover"])],
+                   bordercolor=[("active", C["accent_hover"])], lightcolor=[("active", C["accent_hover"])],
+                   darkcolor=[("active", C["accent_hover"])])
             st.configure("Log.Vertical.TScrollbar", background="#374151", troughcolor=C["log_bg"],
                          bordercolor=C["log_bg"], arrowcolor=C["faint"], lightcolor="#374151",
                          darkcolor="#374151", gripcount=0)
@@ -812,6 +915,7 @@ def build_app(paths, log=None, state=None):
                 w.destroy()
             self.log_widget = None
             self.pulse_canvas = None
+            self._sandbox_bar_key = None
 
         def card(self, parent, padx=20, pady=16, fill="x", expand=False, gap=(0, 12), side=None):
             outer = tk.Frame(parent, bg=C["card"], highlightthickness=1, highlightbackground=C["border"],
@@ -870,7 +974,7 @@ def build_app(paths, log=None, state=None):
         def steps(self, parent, current=None):
             """Draw the 1-2-3 step indicator."""
             canvas = tk.Canvas(parent, height=44, bg=C["bg"], highlightthickness=0)
-            canvas.pack(fill="x", pady=(0, 16))
+            canvas.pack(fill="x", pady=(0, 10))
             x = 20
             r = 15
             for phase in (1, 2, 3):
@@ -894,13 +998,15 @@ def build_app(paths, log=None, state=None):
                     x = x_end + 56 + r + 4
             return canvas
 
-        def badge(self, parent, phase, kind, bg):
+        def badge(self, parent, phase, kind, bg, text=None):
             size = 36
             cv = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0)
             if kind == "good":
                 fill, fg, txt = C["good"], "#ffffff", "\u2713"
             else:
                 fill, fg, txt = C["accent"], "#ffffff", str(phase)
+            if text is not None:
+                txt = text
             cv.create_oval(2, 2, size - 2, size - 2, fill=fill, outline=fill)
             cv.create_text(size / 2, size / 2, text=txt, fill=fg, font=self.f_body_b)
             return cv
@@ -999,6 +1105,166 @@ def build_app(paths, log=None, state=None):
             stamp = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
             return ("Matrix file dated %s  \u00b7  calibrated outside this wizard" % stamp, "good")
 
+        # ---------------- colour height (sea level) ----------------
+        def color_height_state(self):
+            """Return (base_plane, delta_cm, in_use, error). delta is how far above the base
+            plane the colour map's zero sits; in_use says whether SARndbox.cfg carries it."""
+            plane, corners, err = self.layout_values()
+            if plane is None:
+                return None, 0.0, False, err
+            hmp = read_height_map_plane(paths.sandbox_cfg)
+            info = state.get("color_height")
+            if info and "delta" in info:
+                delta = float(info["delta"])
+            elif hmp is not None:
+                delta = hmp[3] - plane[3]
+            else:
+                delta = 0.0
+            return plane, delta, hmp is not None or info is not None, None
+
+        def write_color_height(self, base_plane, delta, live=True):
+            """Persist the colour plane for `delta` in SARndbox.cfg and push it to a running sandbox."""
+            hmp = height_map_plane_for(base_plane, delta)
+            backup = backup_file(paths.sandbox_cfg, paths.backup_dir)
+            write_height_map_plane(paths.sandbox_cfg, hmp)
+            state.mark("color_height", delta=delta)
+            log.write("Wrote heightMapPlane %s to %s (backup: %s)" % (format_plane(hmp), paths.sandbox_cfg, backup))
+            if live:
+                self.send_color_height_live(base_plane, delta)
+
+        def send_color_height_live(self, base_plane, delta):
+            if not sandbox_pids(paths.sandbox_process):
+                return False
+            nx, ny, nz, off = height_map_plane_for(base_plane, delta)
+            return send_control_command(paths.control_fifo, "heightMapPlane %.6g %.6g %.6g %.6g" % (nx, ny, nz, off), log)
+
+        def after_layout_write(self, new_plane, delta, in_use):
+            """Keep the colour height in step after BoxLayout.txt changed."""
+            if in_use:
+                self.write_color_height(new_plane, delta)
+            elif sandbox_pids(paths.sandbox_process):
+                self.send_color_height_live(new_plane, 0.0)
+
+        @staticmethod
+        def format_delta(delta):
+            if abs(delta) < 0.05:
+                return "0 cm"
+            return "%+.1f cm" % delta
+
+        def show_color_height(self):
+            self.clear()
+            plane, delta, in_use, err = self.color_height_state()
+            self.sandbox_bar = self.header(
+                "Color height",
+                "Moves the color bands up or down on the sand without changing the camera calibration. "
+                "Positive raises the sea level (more blue), negative lowers it (more land). A running "
+                "sandbox shows every change immediately; Save keeps it for the next start.")
+            self.refresh_sandbox_bar()
+            if err or plane is None:
+                self.notice(self.body, "BoxLayout.txt is needed first: " + str(err), "bad")
+                ttk.Button(self.button_row(), text="Back to overview", style="Secondary.TButton",
+                           command=self.show_hub).pack(side="right")
+                return
+            self.ch_plane = plane
+            self.ch_saved = delta if in_use else None
+            self.ch_value = delta
+            self._ch_pending = None
+
+            card = self.card(self.body, padx=24, pady=20)
+            top = tk.Frame(card, bg=C["card"])
+            top.pack(fill="x")
+            self.label(top, "Sea level offset from the calibrated base plane", fg=C["muted"]).pack(anchor="w")
+            self.ch_display = self.label(top, self.format_delta(delta), font=self.f_display, fg=C["accent"])
+            self.ch_display.pack(anchor="w", pady=(2, 8))
+
+            self.ch_scale_var = tk.DoubleVar(value=delta)
+            scale = ttk.Scale(card, from_=-20.0, to=20.0, orient="horizontal", variable=self.ch_scale_var,
+                              command=self.ch_scale_moved, style="Horizontal.TScale")
+            scale.pack(fill="x", pady=(0, 2))
+            ticks = tk.Frame(card, bg=C["card"])
+            ticks.pack(fill="x")
+            self.label(ticks, "-20 cm  lower sea level", font=self.f_small, fg=C["muted"]).pack(side="left")
+            self.label(ticks, "raise sea level  +20 cm", font=self.f_small, fg=C["muted"]).pack(side="right")
+
+            steps = tk.Frame(card, bg=C["card"])
+            steps.pack(fill="x", pady=(16, 0))
+            for text, step in (("-5", -5.0), ("-1", -1.0), ("-0.5", -0.5)):
+                ttk.Button(steps, text=text, style="Secondary.TButton", width=6,
+                           command=lambda d=step: self.ch_set(self.ch_value + d)).pack(side="left", padx=(0, 6))
+            ttk.Button(steps, text="Reset to 0", style="Secondary.TButton",
+                       command=lambda: self.ch_set(0.0)).pack(side="left", padx=(12, 12))
+            for text, step in (("+0.5", 0.5), ("+1", 1.0), ("+5", 5.0)):
+                ttk.Button(steps, text=text, style="Secondary.TButton", width=6,
+                           command=lambda d=step: self.ch_set(self.ch_value + d)).pack(side="left", padx=(0, 6))
+
+            self.ch_hint = tk.Frame(self.body, bg=C["bg"])
+            self.ch_hint.pack(fill="x")
+            self.ch_refresh_hint()
+
+            buttons = self.button_row()
+            ttk.Button(buttons, text="Save", style="Primary.TButton", command=self.ch_save).pack(side="left")
+            ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
+                       command=self.ch_back).pack(side="right")
+
+        def ch_refresh_hint(self):
+            f = getattr(self, "ch_hint", None)
+            if f is None or not f.winfo_exists():
+                return
+            for w in f.winfo_children():
+                w.destroy()
+            running = bool(sandbox_pids(paths.sandbox_process))
+            unsaved = self.ch_saved is None or abs(self.ch_value - self.ch_saved) > 1e-6
+            if running:
+                text = "The running sandbox is showing this value. "
+            else:
+                text = "The sandbox is not running, so you cannot see the effect yet; launch it to preview. "
+            if unsaved:
+                text += "Not saved yet: press Save to keep it for the next start."
+                kind = "warn"
+            else:
+                text += "Saved in SARndbox.cfg."
+                kind = "good"
+            self.notice(f, text, kind)
+
+        def ch_scale_moved(self, value):
+            self.ch_set(round(float(value) * 2.0) / 2.0, from_scale=True)
+
+        def ch_set(self, delta, from_scale=False):
+            delta = max(-20.0, min(20.0, round(delta * 2.0) / 2.0))
+            if abs(delta - self.ch_value) < 1e-9 and from_scale:
+                return
+            self.ch_value = delta
+            self.ch_display.configure(text=self.format_delta(delta))
+            if not from_scale:
+                self.ch_scale_var.set(delta)
+            # push to the sandbox after the slider settles
+            if self._ch_pending is not None:
+                self.after_cancel(self._ch_pending)
+            self._ch_pending = self.after(120, self.ch_push_live)
+            self.ch_refresh_hint()
+
+        def ch_push_live(self):
+            self._ch_pending = None
+            self.send_color_height_live(self.ch_plane, self.ch_value)
+
+        def ch_save(self):
+            self.write_color_height(self.ch_plane, self.ch_value)
+            self.ch_saved = self.ch_value
+            self.ch_refresh_hint()
+
+        def ch_back(self):
+            unsaved = self.ch_saved is None or abs(self.ch_value - self.ch_saved) > 1e-6
+            if unsaved and (self.ch_saved is not None or abs(self.ch_value) > 1e-6):
+                answer = messagebox.askyesnocancel(APP_TITLE, "Keep the new color height (%s)?\n\nYes saves it, "
+                                                              "No puts the previous value back." % self.format_delta(self.ch_value))
+                if answer is None:
+                    return
+                if answer:
+                    self.ch_save()
+                else:
+                    self.send_color_height_live(self.ch_plane, self.ch_saved or 0.0)
+            self.show_hub()
+
         # ---------------- hub ----------------
         def show_hub(self):
             self.clear()
@@ -1022,7 +1288,7 @@ def build_app(paths, log=None, state=None):
                 status, kind = self.phase_status(phase)
                 var = tk.BooleanVar(value=kind != "good")
                 self.phase_vars[phase] = var
-                cardf = self.card(self.body, padx=16, pady=12, gap=(0, 10))
+                cardf = self.card(self.body, padx=16, pady=8, gap=(0, 8))
                 cardf.columnconfigure(3, weight=1)
                 ttk.Checkbutton(cardf, variable=var, style="Card.TCheckbutton").grid(
                     row=0, column=0, sticky="n", padx=(0, 6), pady=(4, 0))
@@ -1030,7 +1296,7 @@ def build_app(paths, log=None, state=None):
                 info = tk.Frame(cardf, bg=C["card"])
                 info.grid(row=0, column=2, sticky="nw")
                 self.label(info, "Phase %d  \u00b7  %s" % (phase, PHASE_NAMES[phase]), font=self.f_h2).pack(anchor="w")
-                self.label(info, desc, fg=C["muted"]).pack(anchor="w", pady=(0, 6))
+                self.label(info, desc, fg=C["muted"]).pack(anchor="w", pady=(0, 4))
                 self.pill(info, status, kind).pack(anchor="w")
                 self.label(cardf, values, font=self.f_mono, fg=C["muted_text"]).grid(
                     row=0, column=3, sticky="nw", padx=(24, 12))
@@ -1038,6 +1304,25 @@ def build_app(paths, log=None, state=None):
                            command=lambda p=phase: self.start_phases([p])).grid(row=0, column=4, sticky="ne")
             if err:
                 self.notice(self.body, err, "bad")
+
+            ch_plane, ch_delta, ch_in_use, ch_err = self.color_height_state()
+            cardf = self.card(self.body, padx=16, pady=8, gap=(0, 8))
+            cardf.columnconfigure(3, weight=1)
+            tk.Frame(cardf, bg=C["card"], width=28).grid(row=0, column=0, padx=(0, 6))
+            self.badge(cardf, 0, "accent", C["card"], text="\u2248").grid(row=0, column=1, sticky="n", padx=(0, 14))
+            info = tk.Frame(cardf, bg=C["card"])
+            info.grid(row=0, column=2, sticky="nw")
+            self.label(info, "Color height  \u00b7  Sea level", font=self.f_h2).pack(anchor="w")
+            self.label(info, "Where the water color starts, relative to the calibrated base plane",
+                       fg=C["muted"]).pack(anchor="w", pady=(0, 4))
+            if ch_in_use:
+                self.pill(info, "Set to %s  \u00b7  saved in SARndbox.cfg" % self.format_delta(ch_delta), "good").pack(anchor="w")
+            else:
+                self.pill(info, "Not adjusted  \u00b7  colors follow the base plane", "muted").pack(anchor="w")
+            self.label(cardf, self.format_delta(ch_delta), font=self.f_mono, fg=C["muted_text"]).grid(
+                row=0, column=3, sticky="nw", padx=(24, 12))
+            ttk.Button(cardf, text="Adjust", style="Secondary.TButton",
+                       command=self.show_color_height).grid(row=0, column=4, sticky="ne")
 
             buttons = self.button_row()
             ttk.Button(buttons, text="Run ticked phases", style="Primary.TButton",
@@ -1049,16 +1334,22 @@ def build_app(paths, log=None, state=None):
             ttk.Button(buttons, text="Restore factory defaults", style="Danger.TButton",
                        command=self.restore_defaults).pack(side="left", padx=(10, 0))
             ttk.Button(buttons, text="Quit", style="Secondary.TButton", command=self.on_close).pack(side="right")
-            tk.Frame(self.body, bg=C["bg"], height=14).pack()
-            self.make_log_widget(self.body, height=6)
+            tk.Frame(self.body, bg=C["bg"], height=8).pack()
+            self.make_log_widget(self.body, height=3)
 
-        def refresh_sandbox_bar(self):
+        def refresh_sandbox_bar(self, force=False):
+            """Rebuild the running/stopped indicator only when the sandbox state changed."""
             bar = getattr(self, "sandbox_bar", None)
             if bar is None or not bar.winfo_exists():
                 return
+            pids = sandbox_pids(paths.sandbox_process)
+            key = pids[0] if pids else 0
+            self._last_bar_refresh = time.time()
+            if not force and key == self._sandbox_bar_key and bar.winfo_children():
+                return
+            self._sandbox_bar_key = key
             for w in bar.winfo_children():
                 w.destroy()
-            pids = sandbox_pids(paths.sandbox_process)
             if pids:
                 self.pill(bar, "\u25cf  Sandbox running  \u00b7  pid %d" % pids[0], "good").pack(side="left", padx=(0, 10))
                 ttk.Button(bar, text="Stop sandbox", style="Small.Secondary.TButton",
@@ -1293,7 +1584,7 @@ def build_app(paths, log=None, state=None):
                     self.runner = None
                     self.tool_finished(rc)
             else:
-                if int(time.time()) % 3 == 0:
+                if time.time() - self._last_bar_refresh > 2.0:
                     self.refresh_sandbox_bar()
             self.after(150, self._poll)
 
@@ -1390,9 +1681,11 @@ def build_app(paths, log=None, state=None):
             if plane is None or corners is None or len(corners) != 4:
                 messagebox.showerror(APP_TITLE, "Nothing complete to save.")
                 return
+            _, ch_delta, ch_in_use, _ = self.color_height_state()
             backup = backup_file(paths.box_layout, paths.backup_dir)
             write_box_layout(paths.box_layout, plane, corners)
             log.write("Wrote %s (backup: %s)" % (paths.box_layout, backup))
+            self.after_layout_write(plane, ch_delta, ch_in_use)
             if 1 in s.phases and s.plane:
                 state.mark("plane", value=format_plane(plane), rms=s.plane_rms, serial=s.serial)
             if 2 in s.phases and len(s.corners()) == 4:
@@ -1531,19 +1824,20 @@ def build_app(paths, log=None, state=None):
                 return False
             plane, flipped = normalize_plane(plane)
             warnings = plane_warnings(plane) + corner_warnings(corners, plane)
+            _, ch_delta, ch_in_use, _ = self.color_height_state()
             backup = backup_file(paths.box_layout, paths.backup_dir)
             write_box_layout(paths.box_layout, plane, corners)
             log.write("Wrote %s from the editor (backup: %s)" % (paths.box_layout, backup))
             state.mark("plane", value=format_plane(plane), rms=None, edited=True)
             state.mark("corners", value=[format_point(c) for c in corners], edited=True)
+            self.after_layout_write(plane, ch_delta, ch_in_use)
             msg = "Saved."
             if flipped:
                 msg += " The plane signs were flipped so the offset is negative."
+            if ch_in_use:
+                msg += " The color height of %s was kept relative to the new plane." % self.format_delta(ch_delta)
             if sandbox_pids(paths.sandbox_process):
-                cmd = "heightMapPlane %.6g %.6g %.6g %.6g" % plane
-                if send_control_command(paths.control_fifo, cmd, log):
-                    msg += " The running sandbox now colors heights from the new plane."
-                msg += " Restart the sandbox to apply the corners."
+                msg += " The running sandbox now colors heights from the new plane; restart it to apply the corners."
             if warnings:
                 msg += "\nCheck: " + "\nCheck: ".join(warnings)
             self.set_editor_msg(msg, "warn" if warnings else "good")

@@ -83,6 +83,13 @@ Phases 1 and 2 share one RawKinectViewer window. The wizard:
   height colors follow the new plane at once (`heightMapPlane` on the control pipe); corner changes
   need a sandbox restart, which the screen offers.
 
+The overview also has a **Color height** card. It moves the color bands (the
+sea level) up or down in centimeters relative to the calibrated base plane
+without touching the calibration. A running sandbox shows each change at once
+(`heightMapPlane` on the control pipe); Save writes a `heightMapPlane` line into
+`etc/SARndbox-2.8/SARndbox.cfg`, which SARndbox reads at startup. The offset is
+re-applied automatically when the base plane is recalibrated or edited.
+
 The wizard needs only Python 3.6 or later with Tk (Mint 19.3 ships 3.6).
 Everything is logged to `etc/SARndbox-2.8/calibration.log`. Run
 `python3 bin/CalibrateSandbox.py --check` to print the paths the wizard uses.
