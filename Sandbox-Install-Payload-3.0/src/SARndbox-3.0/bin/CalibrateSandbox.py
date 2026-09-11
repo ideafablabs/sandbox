@@ -751,7 +751,8 @@ class KinectSession(Session):
                      "\u2022 Nothing but sand inside the box: no hands, tools or toys.\n"
                      "\u2022 RawKinectViewer opens full screen. Work in the LEFT half (the depth image) "
                      "and ignore the RIGHT half (the color camera).\n"
-                     "\u2022 Instructions pop up inside that window as you go. Click 'Jolly Good!' to dismiss them.")]
+                     "\u2022 Instructions pop up inside that window as you go. Click OK (or 'Jolly Good!') to "
+                     "dismiss them.")]
         if 1 in self.phases and self.helper_expected:
             sections.append(("Phase 1 \u00b7 Base plane",
                              "1. The wizard captures the flat sand by itself right after the window opens "
