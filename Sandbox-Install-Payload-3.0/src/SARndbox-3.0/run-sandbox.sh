@@ -1,6 +1,8 @@
 #!/bin/bash
 # use the water shader file
 cd ~/src/SARndbox-2.8/
+# apply the projector flip chosen in Calibrate Sandbox (no-op when not flipped)
+./bin/apply-display-rotation.sh --now
 cp share/SARndbox-2.8/Shaders/SurfaceAddWaterColor-Water.fs share/SARndbox-2.8/Shaders/SurfaceAddWaterColor.fs
 # run the sandbox software Look at the SARndbox.cfg file in ~/.config/Vrui-8.0/Applications to see how the
 # keys and buttons are mapped

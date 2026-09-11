@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Exec=/home/sandbox/src/SARndbox-2.8/bin/apply-display-rotation.sh
+Hidden=false
+X-MATE-Autostart-enabled=true
+Name[en_US]=sandbox-display-rotation
+Name=sandbox-display-rotation
+Comment[en_US]=Re-apply the projector flip chosen in Calibrate Sandbox
+Comment=Re-apply the projector flip chosen in Calibrate Sandbox

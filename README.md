@@ -99,12 +99,20 @@ without touching the calibration. A running sandbox shows each change at once
 `etc/SARndbox-2.8/SARndbox.cfg`, which SARndbox reads at startup. The offset is
 re-applied automatically when the base plane is recalibrated or edited.
 
-**Flip view** (button in the top-right corner) turns the whole picture upside
-down for someone standing on the far side of the sandbox. It rotates the
-projector output with `xrandr`, so the wizard switches back to the normal
-orientation by itself whenever it starts RawKinectViewer, CalibrateProjector,
-XBackground or the sandbox, flips again when they exit, and restores the
-original orientation when it quits (the launcher script double-checks this).
+**Flip projector** (button in the top-right corner) turns the projector image
+upside down for good, the way Display Settings would, for a sandbox viewed from
+the far side. It asks for confirmation, rotates the output with `xrandr`, saves
+the choice in `etc/SARndbox-2.8/display-rotation`, and marks every phase that was
+calibrated before the flip as needing a redo (calibration depends on the
+orientation). `bin/apply-display-rotation.sh` re-applies the saved rotation at
+login (`.config/autostart/sandbox-display-rotation.desktop`) and at the start of
+`run-sandbox.sh`, so it survives reboots. Press the button again to go back to
+normal, which again needs a recalibration.
+
+**Panel size.** The wizard draws inside a centred panel that takes 66% of the
+screen, with a dark surround, so the content lands on the sand rather than on
+the box edges. Change it with `--scale 0.5` to `--scale 1.0` (full screen) or
+`SANDBOX_CALIB_SCALE`.
 
 **SandboxHelper plugin.** RawKinectViewer has no command-line switch for
 "Average Frames", and the plane tool needs it. `SandboxHelper/` is a small Vrui
