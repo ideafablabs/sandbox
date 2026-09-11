@@ -90,6 +90,13 @@ without touching the calibration. A running sandbox shows each change at once
 `etc/SARndbox-2.8/SARndbox.cfg`, which SARndbox reads at startup. The offset is
 re-applied automatically when the base plane is recalibrated or edited.
 
+**Flip view** (button in the top-right corner) turns the whole picture upside
+down for someone standing on the far side of the sandbox. It rotates the
+projector output with `xrandr`, so the wizard switches back to the normal
+orientation by itself whenever it starts RawKinectViewer, CalibrateProjector,
+XBackground or the sandbox, flips again when they exit, and restores the
+original orientation when it quits (the launcher script double-checks this).
+
 The wizard needs only Python 3.6 or later with Tk (Mint 19.3 ships 3.6).
 Everything is logged to `etc/SARndbox-2.8/calibration.log`. Run
 `python3 bin/CalibrateSandbox.py --check` to print the paths the wizard uses.

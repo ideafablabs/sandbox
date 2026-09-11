@@ -89,6 +89,8 @@ class Paths:
             ("ProjectorMatrix.dat", self.projector_matrix, os.path.isfile(self.projector_matrix)),
             ("Control.fifo", self.control_fifo, os.path.exists(self.control_fifo)),
         ]
+        output, rotation = detect_display()
+        items.append(("Display (xrandr)", "%s, rotation %s" % (output, rotation), output is not None))
         return items
 
 
@@ -424,6 +426,40 @@ def detect_resolution(default=(1024, 768)):
     if m:
         return (int(m.group(1)), int(m.group(2)))
     return default
+
+
+XRANDR_OUTPUT_RE = re.compile(r"^(\S+) connected(?: primary)? \d+x\d+\+\d+\+\d+(?: (normal|left|inverted|right))? \(")
+FLIPPED_ROTATION = {"normal": "inverted", "inverted": "normal", "left": "right", "right": "left"}
+
+
+def detect_display():
+    """Return (output name, rotation) of the first connected xrandr output, or (None, 'normal')."""
+    try:
+        out = subprocess.run(["xrandr", "--current"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, "normal"
+    for line in out.splitlines():
+        m = XRANDR_OUTPUT_RE.match(line)
+        if m:
+            return m.group(1), (m.group(2) or "normal")
+    return None, "normal"
+
+
+def set_display_rotation(output, rotation, log):
+    """Rotate the given xrandr output. Used to flip the whole screen upside down."""
+    argv = ["xrandr", "--output", output, "--rotate", rotation]
+    try:
+        r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                           timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.write("Could not run xrandr: %s" % e)
+        return False
+    if r.returncode != 0:
+        log.write("xrandr failed (%s): %s" % (" ".join(argv), r.stdout.strip()))
+        return False
+    log.write("Display %s rotated to %s" % (output, rotation))
+    return True
 
 
 def sandbox_pids(process_name):
@@ -824,6 +860,9 @@ def build_app(paths, log=None, state=None):
             self._sandbox_bar_key = None
             self._last_bar_refresh = 0.0
             self.resolution = detect_resolution()
+            self.display_output, self.display_rotation_orig = detect_display()
+            self.flip_wanted = False
+            self.xbg_proc = None
             self.show_hub()
             self.after(200, self._poll)
 
@@ -880,6 +919,7 @@ def build_app(paths, log=None, state=None):
                    background=[("pressed", C["border"]), ("active", "#f9fafb")],
                    bordercolor=[("active", C["faint"])])
             st.configure("Small.Secondary.TButton", padding=(12, 6), font=self.f_small_b)
+            st.configure("Small.Primary.TButton", padding=(12, 6), font=self.f_small_b)
             st.configure("Danger.TButton", background=C["card"], foreground=C["bad"],
                          bordercolor="#fecaca", lightcolor=C["card"], darkcolor=C["card"],
                          borderwidth=1, focusthickness=0, focuscolor=C["card"], padding=(16, 10),
@@ -951,6 +991,12 @@ def build_app(paths, log=None, state=None):
             row.pack(fill="x")
             right = tk.Frame(row, bg=C["bg"])
             right.pack(side="right", anchor="ne", padx=(16, 0))
+            if self.display_output:
+                self.flip_button = ttk.Button(right, command=self.flip_toggle)
+                self.flip_button.pack(side="right", padx=(10, 0))
+                self.refresh_flip_button()
+            status = tk.Frame(right, bg=C["bg"])
+            status.pack(side="left")
             left = tk.Frame(row, bg=C["bg"])
             left.pack(side="left", fill="x", expand=True)
             labels = [self.label(left, title, font=self.f_title, wraplength=760)]
@@ -965,7 +1011,42 @@ def build_app(paths, log=None, state=None):
                         l.configure(wraplength=max(200, event.width - 4))
             left.bind("<Configure>", rewrap)
             tk.Frame(self.body, bg=C["bg"], height=14).pack()
-            return right
+            return status
+
+        # ---------------- flip view (rotate the projector output 180 degrees) ----------------
+        def refresh_flip_button(self):
+            b = getattr(self, "flip_button", None)
+            if b is None or not b.winfo_exists():
+                return
+            if self.flip_wanted:
+                b.configure(text="\u21c5  View flipped", style="Small.Primary.TButton")
+            else:
+                b.configure(text="\u21c5  Flip view", style="Small.Secondary.TButton")
+
+        def flip_toggle(self):
+            self.flip_wanted = not self.flip_wanted
+            if not self.apply_flip():
+                self.flip_wanted = False
+                messagebox.showerror(APP_TITLE, "The display could not be rotated. See the log for the xrandr error.")
+            self.refresh_flip_button()
+
+        def apply_flip(self, tool_starting=False, sandbox_starting=False):
+            """Flip the screen when wanted, but never while a Vrui tool, XBackground or the
+            sandbox is running: their output must stay in the calibrated orientation."""
+            if not self.display_output:
+                return False
+            busy = (tool_starting or sandbox_starting
+                    or (self.runner is not None and self.runner.running())
+                    or (self.xbg_proc is not None and self.xbg_proc.poll() is None)
+                    or bool(sandbox_pids(paths.sandbox_process)))
+            if self.flip_wanted and not busy:
+                desired = FLIPPED_ROTATION.get(self.display_rotation_orig, "inverted")
+            else:
+                desired = self.display_rotation_orig
+            output, current = detect_display()
+            if current == desired:
+                return True
+            return set_display_rotation(self.display_output, desired, log)
 
         def phase_kind(self, phase):
             """'good' when calibrated, 'warn' when factory defaults, 'bad' on error."""
@@ -1347,7 +1428,10 @@ def build_app(paths, log=None, state=None):
             self._last_bar_refresh = time.time()
             if not force and key == self._sandbox_bar_key and bar.winfo_children():
                 return
+            state_changed = self._sandbox_bar_key is not None and key != self._sandbox_bar_key
             self._sandbox_bar_key = key
+            if state_changed:
+                self.apply_flip()
             for w in bar.winfo_children():
                 w.destroy()
             if pids:
@@ -1361,12 +1445,14 @@ def build_app(paths, log=None, state=None):
 
         def stop_sandbox_clicked(self):
             stop_sandbox(paths.sandbox_process, log)
-            self.refresh_sandbox_bar()
+            self.apply_flip()
+            self.refresh_sandbox_bar(force=True)
 
         def launch_sandbox_clicked(self):
             if self.runner is not None and self.runner.running():
                 messagebox.showinfo(APP_TITLE, "Finish or stop the running calibration tool first.")
                 return
+            self.apply_flip(sandbox_starting=True)
             launch_sandbox(paths, log)
             self.after(1500, self.refresh_sandbox_bar)
 
@@ -1473,8 +1559,9 @@ def build_app(paths, log=None, state=None):
                 return
             argv = [paths.xbackground, "-f", "-geometry", "%dx%d" % (w, h)]
             log.write("Running: %s" % " ".join(argv))
+            self.apply_flip(tool_starting=True)
             try:
-                subprocess.Popen(argv, start_new_session=True)
+                self.xbg_proc = subprocess.Popen(argv, start_new_session=True)
             except OSError as e:
                 messagebox.showerror(APP_TITLE, "Could not start XBackground: %s" % e)
             else:
@@ -1513,6 +1600,7 @@ def build_app(paths, log=None, state=None):
                     messagebox.showerror(APP_TITLE, "The sandbox process could not be stopped.")
                     return
             argv = session.argv(paths)
+            self.apply_flip(tool_starting=True)
             try:
                 self.runner = ToolRunner(argv, paths.sarndbox_dir, log)
             except OSError as e:
@@ -1582,8 +1670,12 @@ def build_app(paths, log=None, state=None):
                     rc = runner.proc.wait()
                     log.write("%s exited with code %s" % (self.session.tool_name, rc))
                     self.runner = None
+                    self.apply_flip()
                     self.tool_finished(rc)
             else:
+                if self.xbg_proc is not None and self.xbg_proc.poll() is not None:
+                    self.xbg_proc = None
+                    self.apply_flip()
                 if time.time() - self._last_bar_refresh > 2.0:
                     self.refresh_sandbox_bar()
             self.after(150, self._poll)
@@ -1847,6 +1939,7 @@ def build_app(paths, log=None, state=None):
             if not self.save_editor():
                 return
             stop_sandbox(paths.sandbox_process, log)
+            self.apply_flip(sandbox_starting=True)
             launch_sandbox(paths, log)
             self.set_editor_msg(self.editor_msg.cget("text") + "\nSandbox restarted.", "good")
 
@@ -1856,6 +1949,9 @@ def build_app(paths, log=None, state=None):
                 if not messagebox.askyesno(APP_TITLE, "%s is still running. Stop it and quit?" % self.session.tool_name):
                     return
                 self.runner.stop()
+            if self.flip_wanted:
+                self.flip_wanted = False
+                self.apply_flip()
             self.destroy()
 
     return App
