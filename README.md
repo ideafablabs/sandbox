@@ -67,18 +67,20 @@ running an update on a sandbox PC.
 
 ## Calibrate Sandbox
 
-`bin/CalibrateSandbox.py` (started by `bin/CalibrateSandbox.sh`) wraps the three
-UC Davis calibration steps into one window with three phases:
+`bin/CalibrateSandbox.py` (started by `bin/CalibrateSandbox.sh`) wraps the
+UC Davis calibration steps into one window with four phases:
 
-1. **Base plane** - RawKinectViewer, "Average Frames" (pressed by the SandboxHelper plugin, see below) then key `1` to drag a box over flat sand.
-2. **Box corners** - RawKinectViewer, key `2` on the four corners (lower-left, lower-right, upper-left, upper-right).
-3. **Projector** - CalibrateProjector with the calibration disk, key `1` per point, key `2` to re-capture the background.
+1. **Depth lens** - RawKinectViewer with the "Calibrate Depth Lens" tool, key `1` per
+   distance, key `2` to compute. Optional, once per camera, see below.
+2. **Base plane** - RawKinectViewer, "Average Frames" (pressed by the SandboxHelper plugin, see below) then key `1` to drag a box over flat sand.
+3. **Box corners** - RawKinectViewer, key `2` on the four corners (lower-left, lower-right, upper-left, upper-right).
+4. **Projector** - CalibrateProjector with the calibration disk, key `1` per point, key `2` to re-capture the background.
 
-Phases 1 and 2 share one RawKinectViewer window. The wizard:
+Phases 2 and 3 share one RawKinectViewer window. The wizard:
 
 - shows which phases are done and the current values, and lets you tick which phases to run;
 - sends instructions into the tool window (Vrui `showMessage` on stdin) as each step is reached.
-  In phase 2 every corner press gets a popup that confirms the corner, shows its position and
+  In phase 3 every corner press gets a popup that confirms the corner, shows its position and
   names the next corner; the fourth one also flags a suspicious set (wrong order, duplicate,
   far from the base plane). No popup after pressing `2` means the camera has no depth reading
   at that pixel (black in the depth image), so the tool printed nothing: move further onto
@@ -99,6 +101,32 @@ without touching the calibration. A running sandbox shows each change at once
 `etc/SARndbox-2.8/SARndbox.cfg`, which SARndbox reads at startup. The offset is
 re-applied automatically when the base plane is recalibrated or edited.
 
+**Phase 1, the camera depth lens** (per-pixel depth correction) is the UC Davis
+"Calibrate Depth Lens" step. A Kinect reads a flat surface as slightly
+bowl-shaped, and this measures that distortion from several distances and saves
+`DepthCorrection-<camera serial>.dat` next to the camera's intrinsic parameters
+in `/usr/local/etc/Vrui-8.0/Kinect-3.10`. It is optional and only needed once per
+camera, but it changes every depth reading, so the wizard marks phases 2 to 4 for
+a redo afterwards, the same way a projector flip does. The phase is pre-ticked
+only while no correction file exists, and its screen has a **Skip this phase**
+button.
+
+For the duration of that phase the wizard starts RawKinectViewer with
+`-mergeConfig etc/SARndbox-2.8/DepthLensTools.cfg` (written on the spot), which
+unbinds the plane and corner tools and puts "Calibrate Depth Lens" on keys `1`
+(capture this distance) and `2` (compute and save). The SandboxHelper plugin
+reports each capture and relays the tool's error popup, so the wizard can count
+the captures and explain a failure.
+
+The Kinect configuration directory belongs to root after an install, so
+RawKinectViewer cannot write the file. The wizard checks this before the phase
+and offers a **Fix permissions** button that runs, through `pkexec` (one password
+prompt), the equivalent of:
+
+```
+sudo chown -R sandbox /usr/local/etc/Vrui-8.0/Kinect-3.10
+```
+
 **Flip projector** (button in the top-right corner) turns the projector image
 upside down for good, the way Display Settings would, for a sandbox viewed from
 the far side. It asks for confirmation, rotates the output with `xrandr`, saves
@@ -118,15 +146,19 @@ the box edges. Change it with `--scale 0.5` to `--scale 1.0` (full screen) or
 "Average Frames", and the plane tool needs it. `SandboxHelper/` is a small Vrui
 plugin (a "vislet", built by the install script against the installed Vrui and
 put into Vrui's `VRVislets` directory) that the wizard loads into the tools with
-`-vislet SandboxHelper ;`. It adds three console commands on stdin:
+`-vislet SandboxHelper ;`. It adds four console commands on stdin:
 `sandboxAverage on|off` presses the Average Frames menu entry and prints
 `SandboxHelper: average frame ready` when the capture dialog has gone,
 `sandboxMessage <text>` replaces the open popups with a new one instead of
-stacking them, and `sandboxCloseMessages`. With the plugin the wizard captures
-the flat sand by itself as soon as the camera connects, tells the operator when
-to start dragging, and offers "Capture the sand again" on the running screen.
-Without it (build failed, or `SANDBOX_CALIB_VISLET=none`) the wizard falls back
-to the manual right-click instructions. The UC Davis code is not touched.
+stacking them, `sandboxCloseMessages`, and `sandboxWatch on|off`, which reports
+each average frame capture (`capture started` / `capture done`) and every error
+popup the application shows. With the plugin the wizard captures the flat sand
+by itself as soon as the camera connects, tells the operator when to start
+dragging, offers "Capture the sand again" on the running screen, and in phase 1
+counts the depth captures and reads back the "Calibrate Depth Lens" error
+message. Without it (build failed, or `SANDBOX_CALIB_VISLET=none`) the wizard
+falls back to the manual right-click instructions and stops counting, but every
+phase still works. The UC Davis code is not touched.
 
 The wizard needs only Python 3.6 or later with Tk (Mint 19.3 ships 3.6).
 Everything is logged to `etc/SARndbox-2.8/calibration.log`. Run

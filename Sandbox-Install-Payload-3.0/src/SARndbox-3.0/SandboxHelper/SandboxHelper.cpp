@@ -11,6 +11,11 @@ so the wizard can drive the UC Davis tools without modifying them:
   sandboxMessage <text>   Shows <text> in the plugin's own popup, replacing
                           the previous one (no stacking).
   sandboxCloseMessages    Closes the plugin's popup.
+  sandboxWatch on|off     Reports RawKinectViewer's capture dialog ("capture
+                          started" / "capture done", one pair per "Save Plane"
+                          press of the Calibrate Depth Lens tool) and every new
+                          Vrui error popup ("popup <title>: <text>"), which is
+                          the only way that tool reports a failure.
 
 The plugin never touches Vrui's own message dialogs (showMessage): Vrui
 keeps those in a heap and deletes them itself after one minute, and
@@ -54,6 +59,7 @@ namespace {
    and Vrui's showErrorMessage: */
 const char* AVERAGE_TOGGLE_NAME="AverageFramesButton";
 const char* AVERAGE_DIALOG_NAME="AverageDepthFrameDialogPopup";
+const char* ERROR_POPUP_NAME="VruiErrorMessage"; // Vrui::showErrorMessage / showMessage dialogs
 const char* PREFIX="SandboxHelper: ";
 const size_t LINE_LENGTH=40; // Same wrapping width Vrui uses for its message dialogs
 
@@ -86,6 +92,25 @@ std::vector<std::string> wrapLines(const std::string& text)
 	if(!line.empty())
 		lines.push_back(line);
 	return lines;
+	}
+
+/* Collect the text of all labels inside a widget tree, skipping buttons (which are labels too): */
+void collectText(GLMotif::Widget* widget,std::string& text)
+	{
+	if(dynamic_cast<GLMotif::Button*>(widget)!=0)
+		return;
+	GLMotif::Label* label=dynamic_cast<GLMotif::Label*>(widget);
+	if(label!=0)
+		{
+		if(!text.empty())
+			text.push_back(' ');
+		text.append(label->getString());
+		return;
+		}
+	GLMotif::Container* container=dynamic_cast<GLMotif::Container*>(widget);
+	if(container!=0)
+		for(GLMotif::Widget* child=container->getFirstChild();child!=0;child=container->getNextChild(child))
+			collectText(child,text);
 	}
 
 std::string trimmed(const char* begin,const char* end)
@@ -122,10 +147,14 @@ class SandboxHelper:public Vrui::Vislet
 	bool sawAverageDialog; // The capture dialog has been visible since the toggle was pressed
 	double watchStart; // Application time when the watch began
 	GLMotif::PopupWindow* messageDialog; // The plugin's own message popup, or 0
+	bool watching; // sandboxWatch on: report the capture dialog and error popups
+	bool captureVisible; // Last reported state of the capture dialog
+	std::vector<GLMotif::Widget*> reportedPopups; // Error popups already reported while watching
 	
 	static void averageCommandCallback(const char* argumentBegin,const char* argumentEnd,void* userData);
 	static void messageCommandCallback(const char* argumentBegin,const char* argumentEnd,void* userData);
 	static void closeMessagesCommandCallback(const char* argumentBegin,const char* argumentEnd,void* userData);
+	static void watchCommandCallback(const char* argumentBegin,const char* argumentEnd,void* userData);
 	GLMotif::ToggleButton* findAverageToggle(void) const;
 	static void pressToggle(GLMotif::ToggleButton* toggle,bool set);
 	void showMessage(const std::string& text);
@@ -191,12 +220,14 @@ Methods of class SandboxHelper:
 ******************************/
 
 SandboxHelper::SandboxHelper(int numArguments,const char* const arguments[])
-	:watchingAverage(false),sawAverageDialog(false),watchStart(0.0),messageDialog(0)
+	:watchingAverage(false),sawAverageDialog(false),watchStart(0.0),messageDialog(0),
+	 watching(false),captureVisible(false)
 	{
 	Misc::CommandDispatcher& dispatcher=Vrui::getCommandDispatcher();
 	dispatcher.addCommandCallback("sandboxAverage",&SandboxHelper::averageCommandCallback,this,"on|off","Presses RawKinectViewer's Average Frames menu entry");
 	dispatcher.addCommandCallback("sandboxMessage",&SandboxHelper::messageCommandCallback,this,"<message text>","Replaces open message popups with a new one");
 	dispatcher.addCommandCallback("sandboxCloseMessages",&SandboxHelper::closeMessagesCommandCallback,this,0,"Closes all open message popups");
+	dispatcher.addCommandCallback("sandboxWatch",&SandboxHelper::watchCommandCallback,this,"on|off","Reports the average frame capture dialog and Vrui error popups");
 	std::cout<<PREFIX<<"loaded"<<std::endl;
 	}
 
@@ -337,32 +368,77 @@ void SandboxHelper::closeMessagesCommandCallback(const char* argumentBegin,const
 	std::cout<<PREFIX<<"closed "<<numClosed<<" message popup"<<(numClosed==1?"":"s")<<std::endl;
 	}
 
+void SandboxHelper::watchCommandCallback(const char* argumentBegin,const char* argumentEnd,void* userData)
+	{
+	SandboxHelper* thisPtr=static_cast<SandboxHelper*>(userData);
+	std::string arg=trimmed(argumentBegin,argumentEnd);
+	thisPtr->watching=!(arg=="off"||arg=="0"||arg=="false");
+	thisPtr->captureVisible=false;
+	thisPtr->reportedPopups.clear();
+	Vrui::requestUpdate();
+	std::cout<<PREFIX<<(thisPtr->watching?"watching":"not watching")<<std::endl;
+	}
+
 void SandboxHelper::frame(void)
 	{
-	if(!watchingAverage)
+	if(!watchingAverage&&!watching)
 		return;
 	
-	/* RawKinectViewer shows a "Capturing average depth frame..." dialog while it averages and pops it down when done: */
+	/* RawKinectViewer shows a "Capturing average depth frame..." dialog while it averages and pops it down when done;
+	   Vrui's error popups (the only way the Calibrate Depth Lens tool reports a failure) are named VruiErrorMessage: */
 	bool dialogVisible=false;
+	std::vector<GLMotif::Widget*> errorPopups;
 	GLMotif::WidgetManager* wm=Vrui::getWidgetManager();
 	for(GLMotif::WidgetManager::PoppedWidgetIterator it=wm->beginPrimaryWidgets();it!=wm->endPrimaryWidgets();++it)
-		if(it.isVisible()&&strcmp((*it)->getName(),AVERAGE_DIALOG_NAME)==0)
-			dialogVisible=true;
-	
-	if(dialogVisible)
-		sawAverageDialog=true;
-	else if(sawAverageDialog)
-		{
-		watchingAverage=false;
-		std::cout<<PREFIX<<"average frame ready"<<std::endl;
-		}
-	else if(Vrui::getApplicationTime()-watchStart>3.0)
-		{
-		/* The dialog never showed up (an average frame was already valid or this is not RawKinectViewer): */
-		watchingAverage=false;
-		std::cout<<PREFIX<<"average frame ready (no capture dialog seen)"<<std::endl;
-		}
+		if(it.isVisible())
+			{
+			if(strcmp((*it)->getName(),AVERAGE_DIALOG_NAME)==0)
+				dialogVisible=true;
+			else if(strcmp((*it)->getName(),ERROR_POPUP_NAME)==0)
+				errorPopups.push_back(*it);
+			}
 	
 	if(watchingAverage)
+		{
+		if(dialogVisible)
+			sawAverageDialog=true;
+		else if(sawAverageDialog)
+			{
+			watchingAverage=false;
+			std::cout<<PREFIX<<"average frame ready"<<std::endl;
+			}
+		else if(Vrui::getApplicationTime()-watchStart>3.0)
+			{
+			/* The dialog never showed up (an average frame was already valid or this is not RawKinectViewer): */
+			watchingAverage=false;
+			std::cout<<PREFIX<<"average frame ready (no capture dialog seen)"<<std::endl;
+			}
+		}
+	
+	if(watching)
+		{
+		if(dialogVisible!=captureVisible)
+			{
+			captureVisible=dialogVisible;
+			std::cout<<PREFIX<<(dialogVisible?"capture started":"capture done")<<std::endl;
+			}
+		for(std::vector<GLMotif::Widget*>::iterator pIt=errorPopups.begin();pIt!=errorPopups.end();++pIt)
+			{
+			bool reported=false;
+			for(std::vector<GLMotif::Widget*>::iterator rIt=reportedPopups.begin();rIt!=reportedPopups.end()&&!reported;++rIt)
+				reported=*rIt==*pIt;
+			if(!reported)
+				{
+				/* Only ever read the popup; Vrui deletes it itself after a minute. */
+				GLMotif::PopupWindow* popup=dynamic_cast<GLMotif::PopupWindow*>(*pIt);
+				std::string text;
+				collectText(*pIt,text);
+				std::cout<<PREFIX<<"popup "<<(popup!=0?popup->getTitleString():"")<<": "<<text<<std::endl;
+				}
+			}
+		reportedPopups=errorPopups;
+		}
+	
+	if(watchingAverage||watching)
 		Vrui::scheduleUpdate(Vrui::getApplicationTime()+0.1);
 	}

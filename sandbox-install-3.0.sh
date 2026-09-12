@@ -191,6 +191,7 @@ VISLET_SRC=$SANDBOX_DIR/SandboxHelper
 VRUI_MAKEINCLUDE=/usr/local/share/Vrui-8.0/Vrui.makeinclude
 if [ -f "$VISLET_SRC/SandboxHelper.cpp" ] && [ -f "$VRUI_MAKEINCLUDE" ]; then
     say "Building the SandboxHelper plugin (lets the wizard switch on Average Frames by itself)"
+    make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" clean >/dev/null 2>&1  # never install a stale binary
     if make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" && sudo make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" install; then
         note "SandboxHelper:      built and installed"
     else

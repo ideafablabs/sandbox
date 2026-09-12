@@ -3,9 +3,10 @@
 Calibrate Sandbox - a single-window wizard around the UC Davis AR Sandbox
 calibration tools.
 
-Phase 1  Base plane   (RawKinectViewer, "Extract Planes" tool on key 1)
-Phase 2  Box corners  (RawKinectViewer, "Measure 3D Positions" tool on key 2)
-Phase 3  Projector    (CalibrateProjector, "Capture" tool on keys 1 and 2)
+Phase 1  Depth lens   (RawKinectViewer, "Calibrate Depth Lens" tool on keys 1 and 2)
+Phase 2  Base plane   (RawKinectViewer, "Extract Planes" tool on key 1)
+Phase 3  Box corners  (RawKinectViewer, "Measure 3D Positions" tool on key 2)
+Phase 4  Projector    (CalibrateProjector, "Capture" tool on keys 1 and 2)
 
 The UC Davis programs are not modified. The wizard launches them, sends
 instructions into their window through the Vrui command interface on stdin
@@ -13,7 +14,16 @@ instructions into their window through the Vrui command interface on stdin
 backs up the old files and writes BoxLayout.txt.  CalibrateProjector writes
 ProjectorMatrix.dat itself; the wizard only checks that it did.
 
-Phases 1 and 2 share one RawKinectViewer session when both are selected.
+Phases 2 and 3 share one RawKinectViewer session when both are selected.
+
+Phase 1 is the per-pixel depth correction of the camera (optional, once per
+camera). RawKinectViewer's "Calibrate Depth Lens" tool writes
+DepthCorrection-<serial>.dat into the Kinect configuration directory itself
+(a compiled-in path, /usr/local/etc/Vrui-8.0/Kinect-3.10, owned by root after
+the install; the wizard offers a pkexec fix). The wizard binds that tool to
+keys 1 and 2 for this phase only with a Vrui -mergeConfig file, counts the
+captures through the SandboxHelper plugin, checks that the file appeared and
+marks phases 2 to 4 as needing a redo, since every depth reading changes.
 
 Runs on Python 3.6 and later (Linux Mint 19.3 ships 3.6), standard library only.
 
@@ -26,6 +36,7 @@ Paths can be overridden with environment variables (used for testing):
   SANDBOX_CALIB_RUN_SANDBOX         default <sarndbox>/run-sandbox.sh
   SANDBOX_CALIB_SANDBOX_PROCESS     default SARndbox (process name to detect)
   SANDBOX_CALIB_CONTROL_FIFO        default <sarndbox>/share/SARndbox-2.8/Control.fifo
+  SANDBOX_CALIB_KINECT_ETC_DIR      default /usr/local/etc/Vrui-8.0/Kinect-3.10
 """
 
 import argparse
@@ -46,6 +57,38 @@ HOME = os.path.expanduser("~")
 NUM_TIE_POINTS = 12  # CalibrateProjector default grid 4 x 3
 HELPER_TIMEOUT = 10  # seconds to wait for the SandboxHelper plugin to report before falling back
 DEFAULT_SCALE = 0.66  # the wizard draws inside a centred panel this fraction of the screen (see --scale)
+
+PH_DEPTH, PH_PLANE, PH_CORNERS, PH_PROJECTOR = 1, 2, 3, 4
+ALL_PHASES = (PH_DEPTH, PH_PLANE, PH_CORNERS, PH_PROJECTOR)
+PHASE_NAMES = {PH_DEPTH: "Depth lens", PH_PLANE: "Base plane", PH_CORNERS: "Box corners", PH_PROJECTOR: "Projector"}
+DEPTH_GOOD_CAPTURES = 4  # distances the wizard asks for before suggesting key 2 (the tool needs 2)
+DEPTH_FILE_PREFIX = "DepthCorrection-"  # <prefix><camera serial>.dat, written by RawKinectViewer
+KINECT_ETC_CANDIDATES = ("/usr/local/etc/Vrui-8.0/Kinect-3.10", "/usr/local/etc/Kinect-3.10",
+                         "/etc/Vrui-8.0/Kinect-3.10")
+# Vrui configuration merged into RawKinectViewer for phase 1 only (-mergeConfig <file>). It
+# unbinds the plane and corner tools (an empty bindings list disables a tool section) and puts
+# "Calibrate Depth Lens" on keys 1 (Save Plane) and 2 (Calibrate). The section names mirror
+# .config/Vrui-8.0/Applications/RawKinectViewer.cfg from the payload.
+DEPTH_TOOLS_CFG = """\
+section Vrui
+    section Desktop
+        section Tools
+            section DefaultTools
+                section RawKinectViewerTool0
+                    bindings ()
+                endsection
+                section RawKinectViewerTool1
+                    bindings ()
+                endsection
+                section SandboxDepthLensTool
+                    toolClass DepthCorrectionTool
+                    bindings ((Mouse, 1, 2))
+                endsection
+            endsection
+        endsection
+    endsection
+endsection
+"""
 
 
 def content_scale(value=None):
@@ -92,6 +135,12 @@ class Paths:
                 if hits:
                     self.vislet = hits[0]
                     break
+        # Kinect configuration directory: RawKinectViewer's "Calibrate Depth Lens" tool writes
+        # DepthCorrection-<serial>.dat there (compiled-in path, root-owned after the install).
+        self.kinect_etc_dir = env("SANDBOX_CALIB_KINECT_ETC_DIR", "")
+        if not self.kinect_etc_dir:
+            self.kinect_etc_dir = next((d for d in KINECT_ETC_CANDIDATES if os.path.isdir(d)),
+                                       KINECT_ETC_CANDIDATES[0])
         self.box_layout = os.path.join(self.etc_dir, "BoxLayout.txt")
         self.sandbox_cfg = os.path.join(self.etc_dir, "SARndbox.cfg")
         self.box_layout_orig = self.box_layout + ".orig"
@@ -103,6 +152,8 @@ class Paths:
         # "<output> <rotation>" written by the Flip projector button; bin/apply-display-rotation.sh
         # re-applies it at login and before the sandbox starts.
         self.rotation_file = os.path.join(self.etc_dir, "display-rotation")
+        # Vrui tool bindings for phase 1 (DEPTH_TOOLS_CFG), written before RawKinectViewer starts
+        self.depth_tools_cfg = os.path.join(self.etc_dir, "DepthLensTools.cfg")
 
     def check(self):
         """Return a list of (label, path, ok) tuples for the --check option."""
@@ -119,7 +170,17 @@ class Paths:
             ("ProjectorMatrix.dat", self.projector_matrix, os.path.isfile(self.projector_matrix)),
             ("Control.fifo", self.control_fifo, os.path.exists(self.control_fifo)),
             ("SandboxHelper plugin", self.vislet or "not installed: Average Frames is picked by hand", True),
+            ("Kinect config dir", self.kinect_etc_dir, os.path.isdir(self.kinect_etc_dir)),
+            ("  writable", "yes" if kinect_etc_writable(self.kinect_etc_dir)
+             else "no: phase 1 offers to fix it (pkexec)", True),
         ]
+        intrinsics = sorted(glob.glob(os.path.join(self.kinect_etc_dir, "IntrinsicParameters-*.dat")))
+        items.append(("Camera intrinsics", ", ".join(os.path.basename(p) for p in intrinsics)
+                      or "none: run  sudo KinectUtil getCalib 0", bool(intrinsics)))
+        depth = depth_file_for(self.kinect_etc_dir)
+        items.append(("Depth correction", "%s (%s)" % (os.path.basename(depth[0]),
+                      datetime.datetime.fromtimestamp(depth[2]).strftime("%Y-%m-%d %H:%M")) if depth
+                      else "none (phase 1 not done)", True))
         output, rotation = detect_display()
         items.append(("Display (xrandr)", "%s, rotation %s" % (output, rotation), output is not None))
         saved = read_rotation_file(self.rotation_file)
@@ -174,6 +235,10 @@ EXCEPTION_RE = re.compile(r"Terminated \w+ due to exception:\s*(.*)")
 HELPER_LOADED_RE = re.compile(r"^SandboxHelper: loaded")
 HELPER_IGNORED_RE = re.compile(r"Ignoring vislet of type SandboxHelper")
 HELPER_AVERAGE_RE = re.compile(r"^SandboxHelper: (Average Frames on, capturing|average frame ready|Average Frames off|error: .*)")
+# "sandboxWatch on": the plugin reports RawKinectViewer's capture dialog and Vrui error popups
+HELPER_WATCH_RE = re.compile(r"^SandboxHelper: (capture started|capture done|watching|not watching|popup (.*))$")
+DEPTH_WRITTEN_RE = re.compile(r"Writing depth correction file\s+(\S+)")
+MERGE_MISSING_RE = re.compile(r"Requested configuration file (\S+) not found")
 CORNER_NAMES = ("lower-left", "lower-right", "upper-left", "upper-right")
 
 
@@ -527,6 +592,67 @@ def write_rotation_file(path, output, rotation):
         return False
 
 
+def depth_file_info(path):
+    """(path, serial, mtime) for a DepthCorrection-<serial>.dat path, or None if it is not there."""
+    name = os.path.basename(path)
+    if not (name.startswith(DEPTH_FILE_PREFIX) and name.endswith(".dat")):
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    return path, name[len(DEPTH_FILE_PREFIX):-4], mtime
+
+
+def depth_files(kinect_etc_dir):
+    """All depth correction files in the Kinect config directory, newest first."""
+    items = [depth_file_info(p) for p in glob.glob(os.path.join(kinect_etc_dir, DEPTH_FILE_PREFIX + "*.dat"))]
+    return sorted([i for i in items if i], key=lambda i: -i[2])
+
+
+def depth_file_for(kinect_etc_dir, serial=None):
+    """(path, serial, mtime) of the camera's depth correction file (any camera when serial is
+    None), or None."""
+    for item in depth_files(kinect_etc_dir):
+        if serial is None or item[1] == serial:
+            return item
+    return None
+
+
+def kinect_etc_writable(kinect_etc_dir):
+    """True when RawKinectViewer, running as this user, can write the depth correction file."""
+    if not os.access(kinect_etc_dir, os.W_OK | os.X_OK):
+        return False
+    return all(os.access(path, os.W_OK) for path, _, _ in depth_files(kinect_etc_dir))
+
+
+def fix_kinect_etc_permissions(kinect_etc_dir, log):
+    """Give the Kinect config directory to this user through pkexec (a password prompt).
+    Returns (ok, message)."""
+    owner = "%d:%d" % (os.getuid(), os.getgid())
+    # pkexec needs the program as an absolute path and runs it as root with a clean environment
+    argv = ["pkexec", "/bin/sh", "-c", 'chown -R "$1" "$2" && chmod -R u+rwX "$2"', "fix-permissions",
+            owner, kinect_etc_dir]
+    log.write("Running: %s" % " ".join(argv))
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, "pkexec could not be run: %s" % e
+    output = proc.stdout.strip()
+    if proc.returncode == 0 and kinect_etc_writable(kinect_etc_dir):
+        log.write("%s now belongs to %s" % (kinect_etc_dir, owner))
+        return True, "Done: %s now belongs to you." % kinect_etc_dir
+    if proc.returncode in (126, 127):
+        return False, "Cancelled, or the password was not accepted."
+    return False, "pkexec failed (exit code %s): %s" % (proc.returncode, output or "no output")
+
+
+def write_depth_tools_cfg(path):
+    with open(path, "w") as f:
+        f.write(DEPTH_TOOLS_CFG)
+
+
 def set_display_rotation(output, rotation, log):
     """Rotate the given xrandr output. Used to flip the whole screen upside down."""
     argv = ["xrandr", "--output", output, "--rotate", rotation]
@@ -717,6 +843,162 @@ class Session:
         return None
 
 
+class DepthSession(Session):
+    """Phase 1: per-pixel depth correction with the "Calibrate Depth Lens" tool (keys 1 and 2).
+    Key 1 captures an averaged depth frame (RawKinectViewer shows its 'Capturing average depth
+    frame...' dialog meanwhile), key 2 computes the correction and writes
+    DepthCorrection-<serial>.dat, printing 'Writing depth correction file <path>'. Failures only
+    show up as a Vrui error popup; the SandboxHelper plugin relays both the dialog and such
+    popups ('SandboxHelper: capture done', 'SandboxHelper: popup <title>: <text>') after
+    'sandboxWatch on'."""
+    tool_name = "RawKinectViewer"
+    phases = (PH_DEPTH,)
+
+    def __init__(self, helper_expected=False):
+        Session.__init__(self, helper_expected)
+        self.connected = False
+        self.serial = None
+        self.captures = 0
+        self.capturing = False
+        self.written = None        # path from the tool's "Writing depth correction file" line
+        self.failure = None        # text of the tool's error popup, relayed by the plugin
+        self.merge_missing = None  # Vrui did not find the key bindings file
+        self.started_at = time.time()
+
+    def title(self):
+        return "Phase 1: camera depth lens"
+
+    def argv(self, paths):
+        return ([paths.raw_kinect_viewer, "-compress", "0", "-mergeConfig", paths.depth_tools_cfg]
+                + self.vislet_args(paths))
+
+    def intro_sections(self):
+        return [("What this does",
+                 "The camera sees a flat surface slightly bowl-shaped (lens distortion). This phase "
+                 "measures that on a flat surface at several distances and saves a per-pixel "
+                 "correction for this camera. Do it once per camera. Phases 2 to 4 must be redone "
+                 "afterwards because every depth reading changes."),
+                ("Get ready",
+                 "\u2022 Flatten the sand: it is the last capture.\n"
+                 "\u2022 Find a large flat board (foam board, plywood, a table top) and boxes to prop it "
+                 "at two or three heights between camera and sand.\n"
+                 "\u2022 Or take the camera off its mount and point it at a blank wall from the same "
+                 "distances.\n"
+                 "\u2022 Work in the LEFT half of the window (the depth image)."),
+                ("For each distance (at least %d, more is better)" % DEPTH_GOOD_CAPTURES,
+                 "1. Start close: the surface about 50 cm from the camera and square to it, filling the "
+                 "LEFT image with no black holes and nothing else in view.\n"
+                 "2. Press key 1 and keep everything still for about 5 seconds, until the capture "
+                 "dialog disappears. A popup counts the capture.\n"
+                 "3. Move the surface further away until the colors change, check that it still fills "
+                 "the image, press 1 again."),
+                ("After the last capture",
+                 "Press key 2: the correction is computed and saved by itself, and a popup confirms it. "
+                 "An error popup means too few captures or too many black pixels, so capture more "
+                 "distances with key 1 and press 2 again. Then press Esc to finish.")]
+
+    def intro_text(self, ctx=None):
+        return "\n\n".join("%s\n%s" % sec for sec in self.intro_sections())
+
+    def initial_message(self):
+        return ("PHASE 1 - DEPTH LENS: capture 1 of at least %d. Fill the LEFT image with a flat "
+                "surface about 50 cm from the camera, no black holes. Press key 1 and keep "
+                "everything still for 5 seconds." % DEPTH_GOOD_CAPTURES)
+
+    def on_helper_loaded(self):
+        self.commands.append("sandboxWatch on")
+        return self.initial_message()
+
+    def on_helper_failed(self):
+        self.status = "The SandboxHelper plugin did not load: captures are not counted here."
+        return self.initial_message()
+
+    def capture_message(self):
+        n = self.captures
+        if n < DEPTH_GOOD_CAPTURES:
+            return ("Capture %d done. Move the surface further from the camera (the colors should "
+                    "change), keep it flat, square and filling the LEFT image, then press 1 again. "
+                    "After %d captures press 2 to compute." % (n, DEPTH_GOOD_CAPTURES))
+        return ("Capture %d done. Press 1 for more distances (the flattened sand last), or press "
+                "2 to compute and save the correction." % n)
+
+    def saved_message(self):
+        return ("Depth correction computed and saved (%d capture%s). Press Esc to finish."
+                % (self.captures, "" if self.captures == 1 else "s"))
+
+    def permission_problem(self):
+        t = (self.failure or "").lower()
+        return "permission" in t or "open file" in t or "could not open" in t or "cannot open" in t
+
+    def failure_message(self):
+        if self.permission_problem():
+            return ("The correction could NOT be saved: RawKinectViewer may not write into the "
+                    "Kinect config folder. Press Esc; the wizard offers to fix the permissions.")
+        return ("The computation FAILED (too few captures, or too many black pixels). Capture "
+                "more distances with key 1, then press 2 again.")
+
+    def reminder(self):
+        if self.written and not self.failure:
+            return self.saved_message()
+        if self.capturing:
+            return "Capturing: keep everything still until the capture dialog disappears."
+        if self.captures == 0:
+            return self.initial_message()
+        return self.capture_message()
+
+    def on_line(self, line):
+        handled, message = self.helper_line(line)
+        if handled:
+            return message
+        m = HELPER_WATCH_RE.search(line)
+        if m:
+            what = m.group(1)
+            if what == "capture started":
+                self.capturing = True
+                self.status = "Capturing: keep everything still..."
+            elif what == "capture done":
+                self.capturing = False
+                self.captures += 1
+                self.status = "%d capture%s so far" % (self.captures, "" if self.captures == 1 else "s")
+                if self.captures >= DEPTH_GOOD_CAPTURES:
+                    self.status += ". Press 2 in RawKinectViewer to compute, or 1 for more."
+                return self.capture_message()
+            elif what.startswith("popup") and "Calibrate Depth Lens" in m.group(2):
+                self.failure = m.group(2)
+                self.status = "The tool reported an error: " + self.failure
+                return self.failure_message()
+            return None
+        m = CONNECTED_RE.search(line)
+        if m:
+            self.serial = m.group(1)
+            self.connected = True
+            self.status = "Camera %s connected. Waiting for the first capture (key 1)..." % self.serial
+            return None
+        m = EXCEPTION_RE.search(line)
+        if m:
+            self.error = m.group(1)
+            self.status = "RawKinectViewer stopped: " + self.error
+            return None
+        m = DEPTH_WRITTEN_RE.search(line)
+        if m:
+            self.written = m.group(1)
+            self.failure = None
+            self.status = "Depth correction written to " + self.written
+            return self.saved_message()
+        m = MERGE_MISSING_RE.search(line)
+        if m:
+            self.merge_missing = m.group(1)
+            self.status = ("Key bindings file %s not found: keys 1 and 2 still drive the plane and "
+                           "corner tools" % self.merge_missing)
+            return None
+        return None
+
+    def missing(self):
+        if self.written is None and self.failure is None:
+            return ["no depth correction was computed (press 2 in RawKinectViewer after the captures)"]
+        return []
+
+
 class KinectSession(Session):
     tool_name = "RawKinectViewer"
 
@@ -735,11 +1017,11 @@ class KinectSession(Session):
         self._phase2_prompted = False
 
     def title(self):
-        if self.phases == (1, 2):
-            return "Phases 1 and 2: base plane and box corners"
-        if self.phases == (1,):
-            return "Phase 1: base plane"
-        return "Phase 2: box corners"
+        if self.phases == (PH_PLANE, PH_CORNERS):
+            return "Phases 2 and 3: base plane and box corners"
+        if self.phases == (PH_PLANE,):
+            return "Phase 2: base plane"
+        return "Phase 3: box corners"
 
     def argv(self, paths):
         return [paths.raw_kinect_viewer, "-compress", "0"] + self.vislet_args(paths)
@@ -753,8 +1035,8 @@ class KinectSession(Session):
                      "and ignore the RIGHT half (the color camera).\n"
                      "\u2022 Instructions pop up inside that window as you go. Click OK (or 'Jolly Good!') to "
                      "dismiss them.")]
-        if 1 in self.phases and self.helper_expected:
-            sections.append(("Phase 1 \u00b7 Base plane",
+        if PH_PLANE in self.phases and self.helper_expected:
+            sections.append(("Phase 2 \u00b7 Base plane",
                              "1. The wizard captures the flat sand by itself right after the window opens "
                              "('Capturing average depth frame...' shows for about 5 seconds). Keep hands out "
                              "until the popup says the sand is captured.\n"
@@ -762,15 +1044,15 @@ class KinectSession(Session):
                              "LEFT image, then release the key. Stay inside the sand.\n"
                              "Not happy? Drag again: the last rectangle counts. Touched the sand? Click "
                              "'Capture the sand again' in this window first."))
-        elif 1 in self.phases:
-            sections.append(("Phase 1 \u00b7 Base plane",
+        elif PH_PLANE in self.phases:
+            sections.append(("Phase 2 \u00b7 Base plane",
                              "1. Press and hold the RIGHT mouse button, move onto 'Average Frames' in the menu "
                              "that pops up, and release. Wait until 'Capturing average depth frame...' disappears.\n"
                              "2. Hold down the 1 key and drag a rectangle over a large, flat area of sand in the "
                              "LEFT image, then release the key. Stay inside the sand.\n"
                              "Not happy? Drag again: the last rectangle counts."))
-        if 2 in self.phases:
-            sections.append(("Phase 2 \u00b7 Box corners",
+        if PH_CORNERS in self.phases:
+            sections.append(("Phase 3 \u00b7 Box corners",
                              "Point at each corner of the sand surface in the LEFT image and press the 2 key, "
                              "in this order:\n"
                              "      lower-left \u2192 lower-right \u2192 upper-left \u2192 upper-right\n"
@@ -789,17 +1071,17 @@ class KinectSession(Session):
 
     def initial_message(self):
         if self.helper_expected:
-            phase = "PHASE 1 - BASE PLANE" if 1 in self.phases else "PHASE 2 - CORNERS"
+            phase = "PHASE 2 - BASE PLANE" if PH_PLANE in self.phases else "PHASE 3 - CORNERS"
             return ("%s: starting up. The flat sand is captured automatically in a moment: keep "
                     "hands and tools out of the box." % phase)
         return self.manual_message()
 
     def manual_message(self):
         """Instructions for the case without the SandboxHelper plugin."""
-        if 1 in self.phases:
-            return ("PHASE 1 - BASE PLANE: hold the right mouse button, pick Average Frames, release. "
+        if PH_PLANE in self.phases:
+            return ("PHASE 2 - BASE PLANE: hold the right mouse button, pick Average Frames, release. "
                     "Wait for the capture. Then hold key 1 and drag a box over flat sand in the LEFT image.")
-        return self._corner_prompt("PHASE 2 - CORNERS: ")
+        return self._corner_prompt("PHASE 3 - CORNERS: ")
 
     def request_average(self):
         """Ask the plugin to (re)capture the average depth frame. Returns the popup text."""
@@ -826,12 +1108,12 @@ class KinectSession(Session):
         self.averaging = False
         self.average_ready = True
         self.status = "Sand captured. Waiting for you..."
-        if 1 in self.phases and self.plane is None:
+        if PH_PLANE in self.phases and self.plane is None:
             return "Sand captured. " + self.DRAG_PROMPT
-        if 1 in self.phases:
+        if PH_PLANE in self.phases:
             return ("Sand captured again. Drag again with key 1 to redo the base plane (the last one "
                     "counts), or carry on.")
-        return self._corner_prompt("Sand captured. PHASE 2 - CORNERS: ")
+        return self._corner_prompt("Sand captured. PHASE 3 - CORNERS: ")
 
     NO_POPUP_HINT = ("No popup? The camera has no depth at that pixel (it shows black): move a bit "
                      "further onto the sand and press 2 again.")
@@ -870,14 +1152,14 @@ class KinectSession(Session):
     def reminder(self):
         if self.helper and self.averaging:
             return "Capturing the flat sand: keep hands and tools out of the box for a few seconds."
-        if 1 in self.phases and self.plane is None:
+        if PH_PLANE in self.phases and self.plane is None:
             if self.helper and self.average_ready:
                 return "Sand captured. " + self.DRAG_PROMPT
             return self.manual_message() if (self.helper_failed or not self.helper_expected) else self.initial_message()
-        if 2 in self.phases:
+        if PH_CORNERS in self.phases:
             n = len(self.points)
             if n == 0:
-                return self._corner_prompt("PHASE 2 - CORNERS: ")
+                return self._corner_prompt("PHASE 3 - CORNERS: ")
             if n % 4:
                 return ("%d of 4 corners so far. NEXT: press 2 on the %s corner. %s"
                         % (n % 4, CORNER_NAMES[n % 4].upper(), self.NO_POPUP_HINT))
@@ -924,20 +1206,20 @@ class KinectSession(Session):
         if plane is not None:
             self.plane, self.plane_flipped = normalize_plane(plane)
             self.status = "Base plane captured: " + format_plane(self.plane)
-            if 1 not in self.phases:
+            if PH_PLANE not in self.phases:
                 return None
-            if 2 in self.phases and not self._phase2_prompted:
+            if PH_CORNERS in self.phases and not self._phase2_prompted:
                 self._phase2_prompted = True
-                return self._corner_prompt("Plane captured (offset %.1f cm). PHASE 2 - CORNERS: "
+                return self._corner_prompt("Plane captured (offset %.1f cm). PHASE 3 - CORNERS: "
                                            % self.plane[3])
-            if 2 not in self.phases:
+            if PH_CORNERS not in self.phases:
                 return ("Plane captured (offset %.1f cm). Press Esc to finish, or drag again "
                         "to redo. The last one counts." % self.plane[3])
             return None
         point = parse_point_line(line)
         if point is not None:
             self.points.append(point)
-            if 2 not in self.phases:
+            if PH_CORNERS not in self.phases:
                 n = len(self.points)
                 self.status = "%d corner click%s so far (not part of this phase)" % (n, "" if n == 1 else "s")
                 return None
@@ -950,16 +1232,16 @@ class KinectSession(Session):
 
     def missing(self):
         out = []
-        if 1 in self.phases and self.plane is None:
+        if PH_PLANE in self.phases and self.plane is None:
             out.append("no base plane was captured")
-        if 2 in self.phases and len(self.points) < 4:
+        if PH_CORNERS in self.phases and len(self.points) < 4:
             out.append("only %d of 4 corners were clicked" % len(self.points))
         return out
 
 
 class ProjectorSession(Session):
     tool_name = "CalibrateProjector"
-    phases = (3,)
+    phases = (PH_PROJECTOR,)
 
     def __init__(self, width, height, helper_expected=False):
         Session.__init__(self, helper_expected)
@@ -971,7 +1253,7 @@ class ProjectorSession(Session):
         self.started_at = time.time()
 
     def title(self):
-        return "Phase 3: projector calibration"
+        return "Phase 4: projector calibration"
 
     def argv(self, paths):
         return ([paths.calibrate_projector, "-s", str(self.width), str(self.height),
@@ -1002,7 +1284,7 @@ class ProjectorSession(Session):
         return "\n\n".join("%s\n%s" % sec for sec in self.intro_sections())
 
     def initial_message(self):
-        return ("PHASE 3 - PROJECTOR: hold the disk where the white cross is and press key 1. "
+        return ("PHASE 4 - PROJECTOR: hold the disk where the white cross is and press key 1. "
                 "Repeat for all %d points. Press key 2 after changing the sand." % NUM_TIE_POINTS)
 
     def reminder(self):
@@ -1042,7 +1324,7 @@ class ProjectorSession(Session):
         if m:
             self.calib_error = m.group(1).strip()
             self.status = "Calibration failed: " + self.calib_error
-            return ("Calibration FAILED: some points were bad. Press Esc, then run Phase 3 "
+            return ("Calibration FAILED: some points were bad. Press Esc, then run Phase 4 "
                     "again from scratch.")
         return None
 
@@ -1063,9 +1345,6 @@ PALETTE = {
     "log_bg": "#111827", "log_fg": "#d1d5db",
     "surround": "#0b0f19",
 }
-
-PHASE_NAMES = {1: "Base plane", 2: "Box corners", 3: "Projector"}
-
 
 def build_app(paths, log=None, state=None, scale=None):
     """Build and return the Tk application class bound to the given paths."""
@@ -1123,6 +1402,7 @@ def build_app(paths, log=None, state=None, scale=None):
                 pass
             log.listeners.append(self._on_log_line)
             self.log_widget = None
+            self.log_frame = None
             self.pulse_canvas = None
             self._sandbox_bar_key = None
             self._last_bar_refresh = 0.0
@@ -1237,6 +1517,7 @@ def build_app(paths, log=None, state=None, scale=None):
             for w in self.body.winfo_children():
                 w.destroy()
             self.log_widget = None
+            self.log_frame = None
             self.pulse_canvas = None
             self._sandbox_bar_key = None
 
@@ -1294,7 +1575,7 @@ def build_app(paths, log=None, state=None, scale=None):
                     if l.winfo_exists():
                         l.configure(wraplength=max(200, event.width - 4))
             left.bind("<Configure>", rewrap)
-            tk.Frame(self.body, bg=C["bg"], height=self.px(14)).pack()
+            tk.Frame(self.body, bg=C["bg"], height=self.px(10)).pack()
             return status
 
         # ---------------- flip projector (permanent 180 degree rotation) ----------------
@@ -1320,7 +1601,7 @@ def build_app(paths, log=None, state=None, scale=None):
                                           "This is permanent, like Display Settings: it stays after the wizard "
                                           "closes and after a reboot (the sandbox re-applies it at login).\n\n"
                                           "Everything must be recalibrated afterwards: base plane, box corners "
-                                          "and projector (phases 1 to 3)."):
+                                          "and projector (phases 2 to 4)."):
                 return
             if not set_display_rotation(self.display_output, target, log):
                 messagebox.showerror(APP_TITLE, "The display could not be rotated. See the log for the xrandr error.")
@@ -1336,18 +1617,24 @@ def build_app(paths, log=None, state=None, scale=None):
             else:
                 self.refresh_flip_button()
 
-        def stale_flip(self, done, ts=None):
-            """(suffix, kind) for a phase done at 'done' (text stamp) / 'ts' (epoch seconds):
-            bad when that was before the last projector flip."""
-            flip = state.get("display_flip")
-            if not flip:
-                return ("", "good")
-            if ts is not None and flip.get("ts") is not None:
-                before = ts < flip["ts"]
-            else:
-                before = bool(done) and done < flip.get("done", "")
-            if before:
-                return ("  \u00b7  BEFORE the projector flip of %s: redo" % flip.get("done"), "bad")
+        STALE_EVENTS = (("display_flip", "the projector flip"), ("depth", "the depth lens calibration"))
+
+        def stale_after(self, done, ts=None):
+            """(suffix, kind) for a phase done at 'done' (text stamp) / 'ts' (epoch seconds): bad
+            when that was before the last projector flip or depth lens calibration (phase 1)."""
+            latest = None
+            for key, what in self.STALE_EVENTS:
+                event = state.get(key)
+                if not event:
+                    continue
+                if ts is not None and event.get("ts") is not None:
+                    before = ts < event["ts"]
+                else:
+                    before = bool(done) and done < event.get("done", "")
+                if before and (latest is None or event.get("ts", 0) > latest[0].get("ts", 0)):
+                    latest = (event, what)
+            if latest:
+                return ("  \u00b7  BEFORE %s of %s: redo" % (latest[1], latest[0].get("done")), "bad")
             return ("", "good")
 
         def phase_kind(self, phase):
@@ -1356,13 +1643,13 @@ def build_app(paths, log=None, state=None, scale=None):
 
         def steps(self, parent, current=None):
             """Draw the 1-2-3 step indicator."""
-            canvas = tk.Canvas(parent, height=self.px(44), bg=C["bg"], highlightthickness=0)
-            canvas.pack(fill="x", pady=(self.px(0), self.px(10)))
+            canvas = tk.Canvas(parent, height=self.px(38), bg=C["bg"], highlightthickness=0)
+            canvas.pack(fill="x", pady=(self.px(0), self.px(6)))
             p = self.px
             x = p(20)
-            r = p(15)
-            cy = p(22)
-            for phase in (1, 2, 3):
+            r = p(14)
+            cy = p(19)
+            for phase in ALL_PHASES:
                 kind = self.phase_kind(phase)
                 active = current is not None and phase in (current if isinstance(current, tuple) else (current,))
                 if active:
@@ -1377,10 +1664,10 @@ def build_app(paths, log=None, state=None, scale=None):
                 canvas.create_text(x + r + p(10), cy, text=name, anchor="w", fill=C["text"] if active else C["muted"],
                                    font=self.f_body_b if active else self.f_body)
                 text_w = self.f_body_b.measure(name)
-                x_end = x + r + p(10) + text_w + p(18)
-                if phase < 3:
-                    canvas.create_line(x_end, cy, x_end + p(56), cy, fill=C["border_strong"], width=2)
-                    x = x_end + p(56) + r + p(4)
+                x_end = x + r + p(10) + text_w + p(14)
+                if phase < ALL_PHASES[-1]:
+                    canvas.create_line(x_end, cy, x_end + p(40), cy, fill=C["border_strong"], width=2)
+                    x = x_end + p(40) + r + p(4)
             return canvas
 
         def badge(self, parent, phase, kind, bg, text=None):
@@ -1409,6 +1696,7 @@ def build_app(paths, log=None, state=None, scale=None):
 
         def make_log_widget(self, parent, height=8, title="Activity log"):
             inner = self.card(parent, padx=self.px(0), pady=self.px(0), fill="both", expand=True, gap=(0, 0))
+            self.log_frame = inner.master  # the block that gives way when a screen is taller than the panel
             head = tk.Frame(inner, bg=C["card"], padx=self.px(16), pady=self.px(8))
             head.pack(fill="x")
             self.label(head, title, font=self.f_body_b).pack(side="left")
@@ -1446,34 +1734,53 @@ def build_app(paths, log=None, state=None, scale=None):
             except (OSError, ValueError) as e:
                 return None, None, str(e)
 
+        def depth_status(self):
+            """(text, kind, (path, serial, mtime) or None) for phase 1, from the Kinect config dir."""
+            info = state.get("depth")
+            item = depth_file_for(paths.kinect_etc_dir, info.get("serial") if info else None)
+            if item is None:
+                item = depth_file_for(paths.kinect_etc_dir)
+            if item is None:
+                return ("Not calibrated yet  \u00b7  optional, once per camera", "warn", None)
+            path, serial, mtime = item
+            if info and abs(info.get("mtime", -1) - mtime) < 1.0:
+                text = "Done %s" % info["done"]
+                if info.get("captures"):
+                    text += "  \u00b7  %d captures" % info["captures"]
+                return (text, "good", item)
+            stamp = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            return ("File dated %s  \u00b7  calibrated outside this wizard" % stamp, "good", item)
+
         def phase_status(self, phase):
             """Return (text, kind) describing the status of a phase; kind is good/warn/bad."""
-            if phase in (1, 2):
+            if phase == PH_DEPTH:
+                return self.depth_status()[:2]
+            if phase in (PH_PLANE, PH_CORNERS):
                 plane, corners, err = self.layout_values()
                 if err:
                     return ("BoxLayout.txt unreadable: " + err, "bad")
-                key = "plane" if phase == 1 else "corners"
+                key = "plane" if phase == PH_PLANE else "corners"
                 info = state.get(key)
-                current = format_plane(plane) if phase == 1 else [format_point(c) for c in corners]
+                current = format_plane(plane) if phase == PH_PLANE else [format_point(c) for c in corners]
                 factory = None
                 if os.path.isfile(paths.box_layout_orig):
                     try:
                         oplane, ocorners = read_box_layout(paths.box_layout_orig)
-                        factory = format_plane(oplane) if phase == 1 else [format_point(c) for c in ocorners]
+                        factory = format_plane(oplane) if phase == PH_PLANE else [format_point(c) for c in ocorners]
                     except (OSError, ValueError):
                         factory = None
                 if info and info.get("value") == current:
                     extra = ""
-                    if phase == 1 and info.get("rms") is not None:
+                    if phase == PH_PLANE and info.get("rms") is not None:
                         extra = "  \u00b7  fit RMS %.2f cm" % info["rms"]
-                    suffix, kind = self.stale_flip(info["done"], info.get("ts"))
+                    suffix, kind = self.stale_after(info["done"], info.get("ts"))
                     return ("Done %s%s%s" % (info["done"], extra, suffix), kind)
                 if factory is not None and current == factory:
                     return ("Not calibrated yet  \u00b7  factory defaults", "warn")
                 if info:
                     return ("Edited by hand after %s" % info["done"], "good")
                 return ("Values present  \u00b7  calibrated outside this wizard", "good")
-            # phase 3
+            # phase 4: projector
             if not os.path.isfile(paths.projector_matrix):
                 return ("Not calibrated yet  \u00b7  no ProjectorMatrix.dat", "warn")
             info = state.get("projector")
@@ -1484,13 +1791,13 @@ def build_app(paths, log=None, state=None, scale=None):
                     text += "  \u00b7  RMS %.2f px" % info["rms"]
                 if info.get("resolution"):
                     text += "  \u00b7  %sx%s" % tuple(info["resolution"])
-                suffix, kind = self.stale_flip(info["done"], info.get("ts"))
+                suffix, kind = self.stale_after(info["done"], info.get("ts"))
                 return (text + suffix, kind)
             if os.path.isfile(paths.projector_matrix_orig) and files_equal(paths.projector_matrix,
                                                                            paths.projector_matrix_orig):
                 return ("Not calibrated yet  \u00b7  factory defaults", "warn")
             stamp = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-            suffix, kind = self.stale_flip(stamp, mtime)
+            suffix, kind = self.stale_after(stamp, mtime)
             return ("Matrix file dated %s  \u00b7  calibrated outside this wizard%s" % (stamp, suffix), kind)
 
         # ---------------- colour height (sea level) ----------------
@@ -1658,29 +1965,29 @@ def build_app(paths, log=None, state=None, scale=None):
             self.clear()
             self.session = None
             self.sandbox_bar = self.header("Sandbox calibration",
-                                           "Tick the phases to run and press Run. Phases 1 and 2 share one "
+                                           "Tick the phases to run and press Run. Phases 2 and 3 share one "
                                            "RawKinectViewer window. Values can be adjusted under Edit values.")
             self.refresh_sandbox_bar()
             self.steps(self.body)
-            if self.display_rotation != "normal":
-                self.notice(self.body, "The projector output is flipped (%s). Calibrate in this orientation: "
-                            "phases done before the flip are marked red and need redoing." % self.display_rotation,
-                            "info")
 
             plane, corners, err = self.layout_values()
+            depth_item = self.depth_status()[2]
             self.phase_vars = {}
             rows = [
-                (1, "Flat sand surface as seen by the camera", short_plane(plane) if plane else "-"),
-                (2, "The four corners of the sand surface",
+                (PH_DEPTH, "Per-pixel depth correction of the camera lens",
+                 "camera %s\n%s" % (depth_item[1], datetime.datetime.fromtimestamp(depth_item[2]).strftime("%Y-%m-%d %H:%M"))
+                 if depth_item else "-"),
+                (PH_PLANE, "Flat sand surface as seen by the camera", short_plane(plane) if plane else "-"),
+                (PH_CORNERS, "The four corners of the sand surface",
                  "\n".join("%-12s %s" % (n + ":", short_point(c)) for n, c in zip(CORNER_NAMES, corners))
                  if corners else "-"),
-                (3, "Aligns the projected image with the camera", "Resolution %dx%d" % self.resolution),
+                (PH_PROJECTOR, "Aligns the projected image with the camera", "Resolution %dx%d" % self.resolution),
             ]
             for phase, desc, values in rows:
                 status, kind = self.phase_status(phase)
                 var = tk.BooleanVar(value=kind != "good")
                 self.phase_vars[phase] = var
-                cardf = self.card(self.body, padx=self.px(16), pady=self.px(8), gap=(0, 8))
+                cardf = self.card(self.body, padx=self.px(16), pady=self.px(6), gap=(0, 6))
                 cardf.columnconfigure(3, weight=1)
                 ttk.Checkbutton(cardf, variable=var, style="Card.TCheckbutton").grid(
                     row=0, column=0, sticky="n", padx=(self.px(0), self.px(6)), pady=(self.px(4), self.px(0)))
@@ -1688,17 +1995,17 @@ def build_app(paths, log=None, state=None, scale=None):
                 info = tk.Frame(cardf, bg=C["card"])
                 info.grid(row=0, column=2, sticky="nw")
                 self.label(info, "Phase %d  \u00b7  %s" % (phase, PHASE_NAMES[phase]), font=self.f_h2).pack(anchor="w")
-                self.label(info, desc, fg=C["muted"]).pack(anchor="w", pady=(self.px(0), self.px(4)))
+                self.label(info, desc, fg=C["muted"]).pack(anchor="w", pady=(self.px(0), self.px(3)))
                 self.pill(info, status, kind).pack(anchor="w")
-                self.label(cardf, values, font=self.f_mono, fg=C["muted_text"]).grid(
-                    row=0, column=3, sticky="nw", padx=(self.px(24), self.px(12)))
+                self.label(cardf, values, font=self.f_mono_small, fg=C["muted_text"]).grid(
+                    row=0, column=3, sticky="nw", padx=(self.px(18), self.px(12)))
                 ttk.Button(cardf, text="Run", style="Secondary.TButton",
                            command=lambda p=phase: self.start_phases([p])).grid(row=0, column=4, sticky="ne")
             if err:
                 self.notice(self.body, err, "bad")
 
             ch_plane, ch_delta, ch_in_use, ch_err = self.color_height_state()
-            cardf = self.card(self.body, padx=self.px(16), pady=self.px(8), gap=(0, 8))
+            cardf = self.card(self.body, padx=self.px(16), pady=self.px(6), gap=(0, 6))
             cardf.columnconfigure(3, weight=1)
             tk.Frame(cardf, bg=C["card"], width=self.px(28)).grid(row=0, column=0, padx=(self.px(0), self.px(6)))
             self.badge(cardf, 0, "accent", C["card"], text="\u2248").grid(row=0, column=1, sticky="n", padx=(self.px(0), self.px(14)))
@@ -1706,7 +2013,7 @@ def build_app(paths, log=None, state=None, scale=None):
             info.grid(row=0, column=2, sticky="nw")
             self.label(info, "Color height  \u00b7  Sea level", font=self.f_h2).pack(anchor="w")
             self.label(info, "Where the water color starts, relative to the calibrated base plane",
-                       fg=C["muted"]).pack(anchor="w", pady=(self.px(0), self.px(4)))
+                       fg=C["muted"]).pack(anchor="w", pady=(self.px(0), self.px(3)))
             if ch_in_use:
                 self.pill(info, "Set to %s  \u00b7  saved in SARndbox.cfg" % self.format_delta(ch_delta), "good").pack(anchor="w")
             else:
@@ -1719,14 +2026,14 @@ def build_app(paths, log=None, state=None, scale=None):
             buttons = self.button_row()
             ttk.Button(buttons, text="Run ticked phases", style="Primary.TButton",
                        command=self.run_ticked).pack(side="left")
-            ttk.Button(buttons, text="Run all 3 phases", style="Secondary.TButton",
-                       command=lambda: self.start_phases([1, 2, 3])).pack(side="left", padx=(self.px(10), self.px(0)))
+            ttk.Button(buttons, text="Run all 4 phases", style="Secondary.TButton",
+                       command=lambda: self.start_phases(list(ALL_PHASES))).pack(side="left", padx=(self.px(10), self.px(0)))
             ttk.Button(buttons, text="Edit values", style="Secondary.TButton",
                        command=self.show_editor).pack(side="left", padx=(self.px(10), self.px(0)))
             ttk.Button(buttons, text="Restore factory defaults", style="Danger.TButton",
                        command=self.restore_defaults).pack(side="left", padx=(self.px(10), self.px(0)))
             ttk.Button(buttons, text="Quit", style="Secondary.TButton", command=self.on_close).pack(side="right")
-            tk.Frame(self.body, bg=C["bg"], height=self.px(8)).pack()
+            tk.Frame(self.body, bg=C["bg"], height=self.px(4)).pack()
             self.make_log_widget(self.body, height=1)  # grows into whatever space is left
 
         def refresh_sandbox_bar(self, force=False):
@@ -1763,7 +2070,7 @@ def build_app(paths, log=None, state=None, scale=None):
             self.after(1500, self.refresh_sandbox_bar)
 
         def run_ticked(self):
-            phases = [p for p in (1, 2, 3) if self.phase_vars[p].get()]
+            phases = [p for p in ALL_PHASES if self.phase_vars[p].get()]
             if not phases:
                 messagebox.showinfo(APP_TITLE, "Tick at least one phase first.")
                 return
@@ -1781,7 +2088,11 @@ def build_app(paths, log=None, state=None, scale=None):
                     log.write("Restored %s from %s" % (dst, src))
                 else:
                     log.write("No factory file %s; skipped" % src)
+            depth = state.get("depth")  # the camera's depth correction is not a factory file
             state.clear()
+            if depth:
+                state.data["depth"] = depth
+                state.save()
             self.show_hub()
 
         # ---------------- phase flow ----------------
@@ -1793,10 +2104,13 @@ def build_app(paths, log=None, state=None, scale=None):
             if not self.queue:
                 self.show_hub()
                 return
-            if self.queue[:2] == [1, 2]:
+            if self.queue[0] == PH_DEPTH:
+                self.queue.pop(0)
+                session = DepthSession(bool(paths.vislet))
+            elif self.queue[:2] == [PH_PLANE, PH_CORNERS]:
                 self.queue = self.queue[2:]
-                session = KinectSession((1, 2), bool(paths.vislet))
-            elif self.queue[0] in (1, 2):
+                session = KinectSession((PH_PLANE, PH_CORNERS), bool(paths.vislet))
+            elif self.queue[0] in (PH_PLANE, PH_CORNERS):
                 session = KinectSession((self.queue.pop(0),), bool(paths.vislet))
             else:
                 self.queue.pop(0)
@@ -1816,8 +2130,16 @@ def build_app(paths, log=None, state=None, scale=None):
             if isinstance(session, ProjectorSession):
                 ttk.Button(buttons, text="Show alignment grid", style="Secondary.TButton",
                            command=self.show_alignment_grid).pack(side="left", padx=(self.px(10), self.px(0)))
+            if isinstance(session, DepthSession):
+                ttk.Button(buttons, text="Skip this phase", style="Secondary.TButton",
+                           command=self.next_session).pack(side="left", padx=(self.px(10), self.px(0)))
             ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
                        command=self.abort_to_hub).pack(side="right")
+
+            if isinstance(session, DepthSession) and not kinect_etc_writable(paths.kinect_etc_dir):
+                bottom = tk.Frame(self.body, bg=C["bg"])
+                bottom.pack(side="bottom", fill="x")
+                self.permission_notice(bottom, lambda: self.show_intro(session))
 
             if isinstance(session, ProjectorSession):
                 bottom = tk.Frame(self.body, bg=C["bg"])
@@ -1896,6 +2218,20 @@ def build_app(paths, log=None, state=None, scale=None):
                     log.write("Backed up projector matrix to %s" % backup)
                 session.matrix_mtime_before = (os.path.getmtime(paths.projector_matrix)
                                                if os.path.isfile(paths.projector_matrix) else None)
+                session.started_at = time.time()
+            if isinstance(session, DepthSession):
+                if not kinect_etc_writable(paths.kinect_etc_dir):
+                    if not messagebox.askokcancel(APP_TITLE, "%s is not writable, so RawKinectViewer will not be "
+                                                             "able to save the correction at the end.\n\nStart anyway?"
+                                                  % paths.kinect_etc_dir):
+                        return
+                try:
+                    write_depth_tools_cfg(paths.depth_tools_cfg)
+                except OSError as e:
+                    messagebox.showerror(APP_TITLE, "Could not write the key bindings file %s:\n%s"
+                                         % (paths.depth_tools_cfg, e))
+                    return
+                log.write("Wrote %s (Calibrate Depth Lens on keys 1 and 2)" % paths.depth_tools_cfg)
                 session.started_at = time.time()
             if sandbox_pids(paths.sandbox_process):
                 if not messagebox.askokcancel(APP_TITLE, "The sandbox is running and holds the 3D camera.\n\n"
@@ -2041,12 +2377,109 @@ def build_app(paths, log=None, state=None, scale=None):
                 self.focus_force()
             except tk.TclError:
                 pass
-            if isinstance(self.session, KinectSession):
+            if isinstance(self.session, DepthSession):
+                self.show_depth_result(rc)
+            elif isinstance(self.session, KinectSession):
                 self.show_kinect_result(rc)
             else:
                 self.show_projector_result(rc)
 
         # ---------------- results ----------------
+        def permission_notice(self, parent, after):
+            """Red notice with a Fix permissions button (pkexec); 'after' redraws the screen."""
+            bg, fg = TINTS["bad"]
+            f = tk.Frame(parent, bg=bg)
+            f.pack(fill="x", pady=(self.px(0), self.px(6)))
+            ttk.Button(f, text="Fix permissions", style="Small.Primary.TButton",
+                       command=lambda: self.fix_permissions_clicked(after)).pack(
+                side="right", padx=self.px(12), pady=self.px(8))
+            tk.Label(f, text="Problem:  %s belongs to root, so the correction cannot be saved. "
+                     "Fix permissions asks for the password once and gives that folder to you."
+                     % paths.kinect_etc_dir, bg=bg, fg=fg, font=self.f_body, justify="left",
+                     wraplength=self.px(700), padx=self.px(14), pady=self.px(8)).pack(side="left", anchor="w")
+            return f
+
+        def fix_permissions_clicked(self, after):
+            ok, message = fix_kinect_etc_permissions(paths.kinect_etc_dir, log)
+            log.write("Fix permissions: " + message)
+            if ok:
+                messagebox.showinfo(APP_TITLE, message)
+            else:
+                messagebox.showerror(APP_TITLE, message)
+            after()
+
+        def show_depth_result(self, rc):
+            s = self.session
+            self.clear()
+            self.header(s.title() + "  \u00b7  result", "Check the result, then continue or redo.")
+            self.steps(self.body, current=s.phases)
+            problems, warnings, notes = [], [], []
+            if s.error:
+                problems.append("RawKinectViewer stopped with an error: " + s.error)
+                hint = s.explain_error(s.error)
+                if hint:
+                    problems.append(hint)
+            if s.merge_missing:
+                warnings.append("Vrui did not find the key bindings file %s, so keys 1 and 2 drove the plane "
+                                "and corner tools instead of Calibrate Depth Lens." % s.merge_missing)
+            item = depth_file_info(s.written) if s.written else None
+            if item is None:
+                item = depth_file_for(paths.kinect_etc_dir, s.serial)
+            written = item is not None and item[2] >= s.started_at - 1
+            if s.failure:
+                problems.append("The tool reported: " + s.failure)
+                if s.permission_problem():
+                    problems.append("RawKinectViewer could not write into %s. Use Fix permissions below, then run "
+                                    "this phase again." % paths.kinect_etc_dir)
+            if not written and not problems:
+                problems.append("No new depth correction file was written (%d capture%s taken). Press 2 in "
+                                "RawKinectViewer after the captures next time."
+                                % (s.captures, "" if s.captures == 1 else "s"))
+            if written:
+                path, serial, mtime = item
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = 0
+                notes.append("%s written at %s (%d bytes)." % (
+                    os.path.basename(path), datetime.datetime.fromtimestamp(mtime).strftime("%H:%M:%S"), size))
+                if s.captures and s.captures < DEPTH_GOOD_CAPTURES:
+                    warnings.append("Only %d capture%s: the correction rests on few distances. Consider redoing "
+                                    "it with %d or more." % (s.captures, "" if s.captures == 1 else "s",
+                                                             DEPTH_GOOD_CAPTURES))
+                info = state.get("depth")
+                if not info or abs(info.get("mtime", -1) - mtime) >= 1.0:
+                    state.mark("depth", serial=serial or s.serial, captures=s.captures, mtime=mtime, path=path)
+                    log.write("Depth correction %s written with %d captures; phases 2 to 4 need a redo"
+                              % (path, s.captures))
+                notes.append("Phases 2 to 4 are now marked for a redo: every depth reading has changed.")
+            c = self.card(self.body)
+            self.label(c, "Depth lens correction", font=self.f_h2).pack(anchor="w")
+            row = tk.Frame(c, bg=C["card"])
+            row.pack(anchor="w", pady=(self.px(8), self.px(0)))
+            self.pill(row, "%d capture%s" % (s.captures, "" if s.captures == 1 else "s"),
+                      "good" if s.captures >= DEPTH_GOOD_CAPTURES else "warn").pack(side="left", padx=(self.px(0), self.px(8)))
+            self.pill(row, "camera %s" % (s.serial or "?"), "info").pack(side="left", padx=(self.px(0), self.px(8)))
+            self.pill(row, "file written" if written else "no file", "good" if written else "bad").pack(side="left")
+            for n in notes:
+                self.notice(self.body, n, "good", prefix="\u2713  ")
+            for w in warnings:
+                self.notice(self.body, w, "warn", prefix="Check:  ")
+            for p in problems:
+                self.notice(self.body, p, "bad", prefix="Problem:  ")
+            if not kinect_etc_writable(paths.kinect_etc_dir):
+                self.permission_notice(self.body, lambda: self.show_depth_result(rc))
+            buttons = self.button_row()
+            if written and not problems:
+                ttk.Button(buttons, text="Continue", style="Primary.TButton", command=self.next_session).pack(side="left")
+            ttk.Button(buttons, text="Redo this step", style="Secondary.TButton",
+                       command=lambda: self.show_intro(DepthSession(bool(paths.vislet)))).pack(
+                side="left", padx=(self.px(10), self.px(0)))
+            ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
+                       command=self.abort_to_hub).pack(side="right")
+            tk.Frame(self.body, bg=C["bg"], height=self.px(14)).pack()
+            self.make_log_widget(self.body, height=6, title="Tool output")
+
         def show_kinect_result(self, rc):
             s = self.session
             self.clear()
@@ -2061,22 +2494,22 @@ def build_app(paths, log=None, state=None, scale=None):
             problems += s.missing()
 
             current_plane, current_corners, err = self.layout_values()
-            new_plane = s.plane if (1 in s.phases and s.plane) else current_plane
-            new_corners = s.corners() if (2 in s.phases and len(s.corners()) == 4) else current_corners
+            new_plane = s.plane if (PH_PLANE in s.phases and s.plane) else current_plane
+            new_corners = s.corners() if (PH_CORNERS in s.phases and len(s.corners()) == 4) else current_corners
             self.pending_plane, self.pending_corners = new_plane, new_corners
 
             warnings = []
-            if 1 in s.phases and s.plane:
+            if PH_PLANE in s.phases and s.plane:
                 if s.plane_flipped:
                     warnings.append("The camera reported the plane inverted; the signs were flipped "
                                     "so the offset is negative (as the sandbox expects).")
                 warnings += plane_warnings(s.plane)
-            if 2 in s.phases and len(s.corners()) == 4:
+            if PH_CORNERS in s.phases and len(s.corners()) == 4:
                 warnings += corner_warnings(s.corners(), new_plane)
 
             cards = tk.Frame(self.body, bg=C["bg"])
             cards.pack(fill="x")
-            if 1 in s.phases:
+            if PH_PLANE in s.phases:
                 c1 = self.card(cards, side="left", fill="both", expand=True)
                 self.label(c1, "Base plane", font=self.f_h2).pack(anchor="w")
                 self.label(c1, format_plane(s.plane) if s.plane else "not captured", font=self.f_mono).pack(
@@ -2084,7 +2517,7 @@ def build_app(paths, log=None, state=None, scale=None):
                 if s.plane and s.plane_rms is not None:
                     self.pill(c1, "fit RMS %.2f cm  \u00b7  lower is flatter" % s.plane_rms,
                               "good" if s.plane_rms < 1.0 else "warn").pack(anchor="w")
-            if 2 in s.phases:
+            if PH_CORNERS in s.phases:
                 c2 = self.card(cards, side="left", fill="both", expand=True)
                 self.label(c2, "Box corners", font=self.f_h2).pack(anchor="w")
                 cs = s.corners()
@@ -2103,7 +2536,7 @@ def build_app(paths, log=None, state=None, scale=None):
             if not s.missing():
                 ttk.Button(buttons, text="Save and continue", style="Primary.TButton",
                            command=self.save_kinect_result).pack(side="left")
-            if 2 in s.phases and len(s.corners()) == 4 and any("order" in w for w in warnings):
+            if PH_CORNERS in s.phases and len(s.corners()) == 4 and any("order" in w for w in warnings):
                 ttk.Button(buttons, text="Auto-order corners", style="Secondary.TButton",
                            command=self.auto_order_clicked).pack(side="left", padx=(self.px(10), self.px(0)))
             ttk.Button(buttons, text="Redo this step", style="Secondary.TButton",
@@ -2132,9 +2565,9 @@ def build_app(paths, log=None, state=None, scale=None):
             write_box_layout(paths.box_layout, plane, corners)
             log.write("Wrote %s (backup: %s)" % (paths.box_layout, backup))
             self.after_layout_write(plane, ch_delta, ch_in_use)
-            if 1 in s.phases and s.plane:
+            if PH_PLANE in s.phases and s.plane:
                 state.mark("plane", value=format_plane(plane), rms=s.plane_rms, serial=s.serial)
-            if 2 in s.phases and len(s.corners()) == 4:
+            if PH_CORNERS in s.phases and len(s.corners()) == 4:
                 state.mark("corners", value=[format_point(c) for c in corners], serial=s.serial)
             self.next_session()
 
