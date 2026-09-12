@@ -99,7 +99,10 @@ sea level) up or down in centimeters relative to the calibrated base plane
 without touching the calibration. A running sandbox shows each change at once
 (`heightMapPlane` on the control pipe); Save writes a `heightMapPlane` line into
 `etc/SARndbox-2.8/SARndbox.cfg`, which SARndbox reads at startup. The offset is
-re-applied automatically when the base plane is recalibrated or edited.
+re-applied automatically when the base plane is recalibrated or edited, and
+**Restore factory defaults** sets it back to 0 cm by removing that line again
+(the rest of `SARndbox.cfg`, such as the water speed and camera settings, is
+left alone).
 
 **Phase 1, the camera depth lens** (per-pixel depth correction) is the UC Davis
 "Calibrate Depth Lens" step. A Kinect reads a flat surface as slightly

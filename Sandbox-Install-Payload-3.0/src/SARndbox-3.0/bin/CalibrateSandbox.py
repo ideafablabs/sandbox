@@ -2078,7 +2078,8 @@ def build_app(paths, log=None, state=None, scale=None):
 
         def restore_defaults(self):
             if not messagebox.askyesno(APP_TITLE, "Replace BoxLayout.txt and ProjectorMatrix.dat with the "
-                                                  "factory default files?\n\nThe current files are backed up first."):
+                                                  "factory default files and set the color height back to 0 cm?"
+                                                  "\n\nThe current files are backed up first."):
                 return
             for src, dst in ((paths.box_layout_orig, paths.box_layout),
                              (paths.projector_matrix_orig, paths.projector_matrix)):
@@ -2088,12 +2089,25 @@ def build_app(paths, log=None, state=None, scale=None):
                     log.write("Restored %s from %s" % (dst, src))
                 else:
                     log.write("No factory file %s; skipped" % src)
+            self.reset_color_height()
             depth = state.get("depth")  # the camera's depth correction is not a factory file
             state.clear()
             if depth:
                 state.data["depth"] = depth
                 state.save()
             self.show_hub()
+
+        def reset_color_height(self):
+            """Put the sea level back on the base plane. The color height has no factory file: it is
+            a heightMapPlane line in SARndbox.cfg, so the line is removed and the rest of the file
+            (water speed, camera settings) is left alone."""
+            if read_height_map_plane(paths.sandbox_cfg) is not None:
+                backup = backup_file(paths.sandbox_cfg, paths.backup_dir)
+                write_height_map_plane(paths.sandbox_cfg, None)
+                log.write("Removed heightMapPlane from %s (backup: %s)" % (paths.sandbox_cfg, backup))
+            plane, _, _ = self.layout_values()
+            if plane is not None and self.send_color_height_live(plane, 0.0):
+                log.write("Told the running sandbox to color heights from the base plane again")
 
         # ---------------- phase flow ----------------
         def start_phases(self, phases):
