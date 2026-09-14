@@ -619,6 +619,19 @@ def depth_file_for(kinect_etc_dir, serial=None):
     return None
 
 
+def remove_depth_file(item, backup_dir, log):
+    """Throw away one depth correction file, keeping a copy in the backups folder.
+    Returns (ok, backup path or error text)."""
+    path = item[0]
+    backup = backup_file(path, backup_dir)
+    try:
+        os.remove(path)
+    except OSError as e:
+        return False, "%s could not be deleted: %s" % (os.path.basename(path), e.strerror or e)
+    log.write("Deleted %s (backup: %s)" % (path, backup))
+    return True, backup
+
+
 def kinect_etc_writable(kinect_etc_dir):
     """True when RawKinectViewer, running as this user, can write the depth correction file."""
     if not os.access(kinect_etc_dir, os.W_OK | os.X_OK):
@@ -1617,7 +1630,8 @@ def build_app(paths, log=None, state=None, scale=None):
             else:
                 self.refresh_flip_button()
 
-        STALE_EVENTS = (("display_flip", "the projector flip"), ("depth", "the depth lens calibration"))
+        STALE_EVENTS = (("display_flip", "the projector flip"), ("depth", "the depth lens calibration"),
+                        ("depth_removed", "the depth lens reset"))
 
         def stale_after(self, done, ts=None):
             """(suffix, kind) for a phase done at 'done' (text stamp) / 'ts' (epoch seconds): bad
@@ -2150,10 +2164,14 @@ def build_app(paths, log=None, state=None, scale=None):
             ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
                        command=self.abort_to_hub).pack(side="right")
 
-            if isinstance(session, DepthSession) and not kinect_etc_writable(paths.kinect_etc_dir):
+            if isinstance(session, DepthSession):
                 bottom = tk.Frame(self.body, bg=C["bg"])
                 bottom.pack(side="bottom", fill="x")
-                self.permission_notice(bottom, lambda: self.show_intro(session))
+                if not kinect_etc_writable(paths.kinect_etc_dir):
+                    self.permission_notice(bottom, lambda: self.show_intro(session))
+                item = self.depth_status()[2]
+                if item is not None:
+                    self.existing_depth_notice(bottom, item, lambda: self.show_intro(session))
 
             if isinstance(session, ProjectorSession):
                 bottom = tk.Frame(self.body, bg=C["bg"])
@@ -2412,6 +2430,51 @@ def build_app(paths, log=None, state=None, scale=None):
                      % paths.kinect_etc_dir, bg=bg, fg=fg, font=self.f_body, justify="left",
                      wraplength=self.px(700), padx=self.px(14), pady=self.px(8)).pack(side="left", anchor="w")
             return f
+
+        def existing_depth_notice(self, parent, item, after):
+            """Phase 1 band: this camera already has a correction, with the button that throws it out."""
+            path, serial, mtime = item
+            when = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            bg, fg = TINTS["info"]
+            f = tk.Frame(parent, bg=bg)
+            f.pack(fill="x", pady=(self.px(0), self.px(6)))
+            ttk.Button(f, text="Delete it and start clean", style="Small.Secondary.TButton",
+                       command=lambda: self.delete_depth_clicked(after)).pack(
+                side="right", padx=self.px(12), pady=self.px(8))
+            tk.Label(f, text="Camera %s already has a depth correction from %s. Capturing this phase again "
+                     "replaces it, so deleting is only needed to go back to uncorrected readings."
+                     % (serial, when), bg=bg, fg=fg, font=self.f_body, justify="left",
+                     wraplength=self.px(680), padx=self.px(14), pady=self.px(8)).pack(side="left", anchor="w")
+            return f
+
+        def delete_depth_clicked(self, after):
+            """Throw the DepthCorrection-<serial>.dat file out and start phase 1 from nothing."""
+            item = self.depth_status()[2]
+            if item is None:
+                return
+            path, serial, mtime = item
+            when = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            if not messagebox.askyesno(APP_TITLE,
+                                       "Delete the depth correction of camera %s?\n\n"
+                                       "%s, saved %s\n\n"
+                                       "The camera goes back to uncorrected (slightly bowl-shaped) depth "
+                                       "readings until this phase is run again, and the base plane, box "
+                                       "corners and projector have to be redone afterwards.\n\n"
+                                       "A copy is kept in the backups folder, and a running sandbox keeps "
+                                       "the old correction until it is restarted."
+                                       % (serial, os.path.basename(path), when)):
+                return
+            ok, info = remove_depth_file(item, paths.backup_dir, log)
+            if not ok:
+                extra = ("\n\nUse Fix permissions first, then try again."
+                         if not kinect_etc_writable(paths.kinect_etc_dir) else "")
+                messagebox.showerror(APP_TITLE, info + extra)
+                return
+            state.data.pop("depth", None)
+            state.mark("depth_removed", serial=serial, path=path)
+            log.write("Depth correction removed; phases 2 to 4 need a redo")
+            messagebox.showinfo(APP_TITLE, "Deleted. A copy is in %s" % (info or paths.backup_dir))
+            after()
 
         def fix_permissions_clicked(self, after):
             ok, message = fix_kinect_etc_permissions(paths.kinect_etc_dir, log)

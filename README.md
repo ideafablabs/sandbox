@@ -121,6 +121,14 @@ unbinds the plane and corner tools and puts "Calibrate Depth Lens" on keys `1`
 reports each capture and relays the tool's error popup, so the wizard can count
 the captures and explain a failure.
 
+The phase 1 screen shows whether the camera already has a correction and has a
+**Delete it and start clean** button that throws the `.dat` file out after a
+confirmation (a copy goes to `etc/SARndbox-2.8/backups/`). Deleting is not
+needed before recalibrating, because RawKinectViewer always computes from raw
+depth values and overwrites the file; it is there to put the camera back to
+uncorrected readings. Like calibrating, it marks phases 2 to 4 for a redo, and a
+running sandbox keeps the old correction until it is restarted.
+
 The Kinect configuration directory belongs to root after an install, so
 RawKinectViewer cannot write the file. The wizard checks this before the phase
 and offers a **Fix permissions** button that runs, through `pkexec` (one password
