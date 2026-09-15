@@ -167,7 +167,9 @@ else
 fi
 
 # Desktop icons that older payloads shipped and the wizard replaces
-for f in "$HOME/Desktop/ExtractPlanes.desktop" "$HOME/Desktop/Measure3D (copy).desktop" "$HOME/Desktop/CalibrateProjector.desktop"; do
+for f in "$HOME/Desktop/ExtractPlanes.desktop" "$HOME/Desktop/Measure3D (copy).desktop" \
+         "$HOME/Desktop/CalibrateProjector.desktop" "$HOME/Desktop/XBackground.desktop" \
+         "$HOME/Desktop/RestoreDefaults.desktop"; do
     if [ -e "$f" ]; then
         rm -f "$f" && note "Removed old icon:   $(basename "$f")"
     fi

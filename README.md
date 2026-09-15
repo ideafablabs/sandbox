@@ -62,25 +62,28 @@ running an update on a sandbox PC.
 | --- | --- |
 | Sandbox | Starts the sandbox (`run-sandbox.sh`). Also started automatically at login. |
 | Calibrate Sandbox | One-window calibration wizard, see below. |
-| XBackground | Shows the projector alignment grid. |
-| RestoreDefaults | Restores the factory `BoxLayout.txt` and `ProjectorMatrix.dat`. |
+
+The XBackground and RestoreDefaults icons are gone: the wizard has the alignment
+grid on its projector screen and a **Restore factory defaults** button on the
+overview. An update removes the two old icons from the desktop. Nothing else is
+lost: `bin/Restore.sh` is still there and XBackground is still on the path, so
+both can be run from a terminal.
 
 ## Calibrate Sandbox
 
 `bin/CalibrateSandbox.py` (started by `bin/CalibrateSandbox.sh`) wraps the
-UC Davis calibration steps into one window with four phases:
+UC Davis calibration steps into one window with three phases:
 
-1. **Depth lens** - RawKinectViewer with the "Calibrate Depth Lens" tool, key `1` per
-   distance, key `2` to compute. Optional, once per camera, see below.
-2. **Base plane** - RawKinectViewer, "Average Frames" (pressed by the SandboxHelper plugin, see below) then key `1` to drag a box over flat sand.
-3. **Box corners** - RawKinectViewer, key `2` on the four corners (lower-left, lower-right, upper-left, upper-right).
-4. **Projector** - CalibrateProjector with the calibration disk, key `1` per point, key `2` to re-capture the background.
+1. **Base plane** - RawKinectViewer, "Average Frames" (pressed by the SandboxHelper plugin, see below) then key `1` to drag a box over flat sand.
+2. **Box corners** - RawKinectViewer, key `2` on the four corners (lower-left, lower-right, upper-left, upper-right).
+3. **Projector** - CalibrateProjector with the calibration disk, key `1` per point, key `2` to re-capture the background.
 
-Phases 2 and 3 share one RawKinectViewer window. The wizard:
+A fourth phase, the camera depth lens, is built but hidden (see below). Phases 1
+and 2 share one RawKinectViewer window. The wizard:
 
 - shows which phases are done and the current values, and lets you tick which phases to run;
 - sends instructions into the tool window (Vrui `showMessage` on stdin) as each step is reached.
-  In phase 3 every corner press gets a popup that confirms the corner, shows its position and
+  In phase 2 every corner press gets a popup that confirms the corner, shows its position and
   names the next corner; the fourth one also flags a suspicious set (wrong order, duplicate,
   far from the base plane). No popup after pressing `2` means the camera has no depth reading
   at that pixel (black in the depth image), so the tool printed nothing: move further onto
@@ -96,23 +99,35 @@ Phases 2 and 3 share one RawKinectViewer window. The wizard:
 
 The overview also has a **Color height** card. It moves the color bands (the
 sea level) up or down in centimeters relative to the calibrated base plane
-without touching the calibration. A running sandbox shows each change at once
-(`heightMapPlane` on the control pipe); Save writes a `heightMapPlane` line into
-`etc/SARndbox-2.8/SARndbox.cfg`, which SARndbox reads at startup. The offset is
+without touching the calibration. There is no Save button: every change is
+written straight into `etc/SARndbox-2.8/SARndbox.cfg` as a `heightMapPlane` line
+(once the slider settles, and `SARndbox.cfg` is backed up once per visit), and a
+running sandbox shows it at once through `heightMapPlane` on the control pipe.
+The offset is
 re-applied automatically when the base plane is recalibrated or edited, and
 **Restore factory defaults** sets it back to 0 cm by removing that line again
 (the rest of `SARndbox.cfg`, such as the water speed and camera settings, is
 left alone).
 
-**Phase 1, the camera depth lens** (per-pixel depth correction) is the UC Davis
+**The camera depth lens phase** (per-pixel depth correction) is the UC Davis
 "Calibrate Depth Lens" step. A Kinect reads a flat surface as slightly
 bowl-shaped, and this measures that distortion from several distances and saves
 `DepthCorrection-<camera serial>.dat` next to the camera's intrinsic parameters
-in `/usr/local/etc/Vrui-8.0/Kinect-3.10`. It is optional and only needed once per
-camera, but it changes every depth reading, so the wizard marks phases 2 to 4 for
-a redo afterwards, the same way a projector flip does. The phase is pre-ticked
-only while no correction file exists, and its screen has a **Skip this phase**
-button.
+in `/usr/local/etc/Vrui-8.0/Kinect-3.10`.
+
+**It is hidden for now.** It needs a large flat board held at several distances,
+is only worth doing once per camera, and has not been tried on the sandbox PC, so
+the wizard shows the three phases above. Start it with:
+
+```
+SANDBOX_CALIB_DEPTH=1 ~/src/SARndbox-2.8/bin/CalibrateSandbox.sh
+```
+
+It then appears as phase 1 and the others become phases 2 to 4; the numbers on
+screen always follow the phases that are visible. It is pre-ticked only while no
+correction file exists, its screen has a **Skip this phase** button, and because
+it changes every depth reading it marks the other phases for a redo afterwards,
+the same way a projector flip does.
 
 For the duration of that phase the wizard starts RawKinectViewer with
 `-mergeConfig etc/SARndbox-2.8/DepthLensTools.cfg` (written on the spot), which
@@ -126,8 +141,8 @@ The phase 1 screen shows whether the camera already has a correction and has a
 confirmation (a copy goes to `etc/SARndbox-2.8/backups/`). Deleting is not
 needed before recalibrating, because RawKinectViewer always computes from raw
 depth values and overwrites the file; it is there to put the camera back to
-uncorrected readings. Like calibrating, it marks phases 2 to 4 for a redo, and a
-running sandbox keeps the old correction until it is restarted.
+uncorrected readings. Like calibrating, it marks the other phases for a redo,
+and a running sandbox keeps the old correction until it is restarted.
 
 The Kinect configuration directory belongs to root after an install, so
 RawKinectViewer cannot write the file. The wizard checks this before the phase

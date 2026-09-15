@@ -3,10 +3,11 @@
 Calibrate Sandbox - a single-window wizard around the UC Davis AR Sandbox
 calibration tools.
 
-Phase 1  Depth lens   (RawKinectViewer, "Calibrate Depth Lens" tool on keys 1 and 2)
-Phase 2  Base plane   (RawKinectViewer, "Extract Planes" tool on key 1)
-Phase 3  Box corners  (RawKinectViewer, "Measure 3D Positions" tool on key 2)
-Phase 4  Projector    (CalibrateProjector, "Capture" tool on keys 1 and 2)
+Base plane   (RawKinectViewer, "Extract Planes" tool on key 1)
+Box corners  (RawKinectViewer, "Measure 3D Positions" tool on key 2)
+Projector    (CalibrateProjector, "Capture" tool on keys 1 and 2)
+Depth lens   (RawKinectViewer, "Calibrate Depth Lens" tool on keys 1 and 2), hidden
+             unless SANDBOX_CALIB_DEPTH=1; it then comes first and renumbers the rest.
 
 The UC Davis programs are not modified. The wizard launches them, sends
 instructions into their window through the Vrui command interface on stdin
@@ -14,16 +15,18 @@ instructions into their window through the Vrui command interface on stdin
 backs up the old files and writes BoxLayout.txt.  CalibrateProjector writes
 ProjectorMatrix.dat itself; the wizard only checks that it did.
 
-Phases 2 and 3 share one RawKinectViewer session when both are selected.
+The base plane and box corners share one RawKinectViewer session when both are
+selected. Phases are numbered on screen by their position in ALL_PHASES, so the
+numbers move when the depth lens phase is switched on.
 
-Phase 1 is the per-pixel depth correction of the camera (optional, once per
-camera). RawKinectViewer's "Calibrate Depth Lens" tool writes
+The depth lens phase is the per-pixel depth correction of the camera (optional,
+once per camera). RawKinectViewer's "Calibrate Depth Lens" tool writes
 DepthCorrection-<serial>.dat into the Kinect configuration directory itself
 (a compiled-in path, /usr/local/etc/Vrui-8.0/Kinect-3.10, owned by root after
 the install; the wizard offers a pkexec fix). The wizard binds that tool to
 keys 1 and 2 for this phase only with a Vrui -mergeConfig file, counts the
 captures through the SandboxHelper plugin, checks that the file appeared and
-marks phases 2 to 4 as needing a redo, since every depth reading changes.
+marks the other phases as needing a redo, since every depth reading changes.
 
 Runs on Python 3.6 and later (Linux Mint 19.3 ships 3.6), standard library only.
 
@@ -37,6 +40,7 @@ Paths can be overridden with environment variables (used for testing):
   SANDBOX_CALIB_SANDBOX_PROCESS     default SARndbox (process name to detect)
   SANDBOX_CALIB_CONTROL_FIFO        default <sarndbox>/share/SARndbox-2.8/Control.fifo
   SANDBOX_CALIB_KINECT_ETC_DIR      default /usr/local/etc/Vrui-8.0/Kinect-3.10
+  SANDBOX_CALIB_DEPTH               1 shows the depth lens phase (hidden by default)
 """
 
 import argparse
@@ -58,9 +62,40 @@ NUM_TIE_POINTS = 12  # CalibrateProjector default grid 4 x 3
 HELPER_TIMEOUT = 10  # seconds to wait for the SandboxHelper plugin to report before falling back
 DEFAULT_SCALE = 0.66  # the wizard draws inside a centred panel this fraction of the screen (see --scale)
 
-PH_DEPTH, PH_PLANE, PH_CORNERS, PH_PROJECTOR = 1, 2, 3, 4
-ALL_PHASES = (PH_DEPTH, PH_PLANE, PH_CORNERS, PH_PROJECTOR)
+# Internal phase ids. What the user sees is the position in ALL_PHASES, so hiding a phase
+# renumbers the rest; never print these.
+PH_DEPTH, PH_PLANE, PH_CORNERS, PH_PROJECTOR = 0, 1, 2, 3
 PHASE_NAMES = {PH_DEPTH: "Depth lens", PH_PLANE: "Base plane", PH_CORNERS: "Box corners", PH_PROJECTOR: "Projector"}
+CORE_PHASES = (PH_PLANE, PH_CORNERS, PH_PROJECTOR)
+PHASE_ORDER = (PH_DEPTH,) + CORE_PHASES
+ALL_PHASES = CORE_PHASES  # set_depth_phase() rewrites this
+
+
+def set_depth_phase(enabled):
+    """Show or hide the camera depth lens phase. It is off by default: it needs a flat board at
+    several distances, is only worth doing once per camera, and the wizard is normally used for
+    the three phases that follow. SANDBOX_CALIB_DEPTH=1 brings it back as the first phase."""
+    global ALL_PHASES
+    ALL_PHASES = PHASE_ORDER if enabled else CORE_PHASES
+
+
+def depth_phase_enabled():
+    return PH_DEPTH in ALL_PHASES
+
+
+def phase_number(phase):
+    """The number the user sees for a phase: its position among the visible ones."""
+    phases = ALL_PHASES if phase in ALL_PHASES else PHASE_ORDER
+    return phases.index(phase) + 1
+
+
+def phase_range(phases):
+    """e.g. "phases 1 to 3", for warnings about what has to be recalibrated."""
+    numbers = sorted(phase_number(p) for p in phases)
+    return "phases %d to %d" % (numbers[0], numbers[-1])
+
+
+set_depth_phase(os.environ.get("SANDBOX_CALIB_DEPTH", "").strip().lower() in ("1", "on", "yes", "true"))
 DEPTH_GOOD_CAPTURES = 4  # distances the wizard asks for before suggesting key 2 (the tool needs 2)
 DEPTH_FILE_PREFIX = "DepthCorrection-"  # <prefix><camera serial>.dat, written by RawKinectViewer
 KINECT_ETC_CANDIDATES = ("/usr/local/etc/Vrui-8.0/Kinect-3.10", "/usr/local/etc/Kinect-3.10",
@@ -172,7 +207,7 @@ class Paths:
             ("SandboxHelper plugin", self.vislet or "not installed: Average Frames is picked by hand", True),
             ("Kinect config dir", self.kinect_etc_dir, os.path.isdir(self.kinect_etc_dir)),
             ("  writable", "yes" if kinect_etc_writable(self.kinect_etc_dir)
-             else "no: phase 1 offers to fix it (pkexec)", True),
+             else "no: the depth lens phase offers to fix it (pkexec)", True),
         ]
         intrinsics = sorted(glob.glob(os.path.join(self.kinect_etc_dir, "IntrinsicParameters-*.dat")))
         items.append(("Camera intrinsics", ", ".join(os.path.basename(p) for p in intrinsics)
@@ -180,7 +215,7 @@ class Paths:
         depth = depth_file_for(self.kinect_etc_dir)
         items.append(("Depth correction", "%s (%s)" % (os.path.basename(depth[0]),
                       datetime.datetime.fromtimestamp(depth[2]).strftime("%Y-%m-%d %H:%M")) if depth
-                      else "none (phase 1 not done)", True))
+                      else "none (not calibrated)", True))
         output, rotation = detect_display()
         items.append(("Display (xrandr)", "%s, rotation %s" % (output, rotation), output is not None))
         saved = read_rotation_file(self.rotation_file)
@@ -879,7 +914,7 @@ class DepthSession(Session):
         self.started_at = time.time()
 
     def title(self):
-        return "Phase 1: camera depth lens"
+        return "Phase %d: camera depth lens" % phase_number(PH_DEPTH)
 
     def argv(self, paths):
         return ([paths.raw_kinect_viewer, "-compress", "0", "-mergeConfig", paths.depth_tools_cfg]
@@ -889,8 +924,8 @@ class DepthSession(Session):
         return [("What this does",
                  "The camera sees a flat surface slightly bowl-shaped (lens distortion). This phase "
                  "measures that on a flat surface at several distances and saves a per-pixel "
-                 "correction for this camera. Do it once per camera. Phases 2 to 4 must be redone "
-                 "afterwards because every depth reading changes."),
+                 "correction for this camera. Do it once per camera. The other %s must be redone "
+                 "afterwards because every depth reading changes." % phase_range(CORE_PHASES)),
                 ("Get ready",
                  "\u2022 Flatten the sand: it is the last capture.\n"
                  "\u2022 Find a large flat board (foam board, plywood, a table top) and boxes to prop it "
@@ -914,9 +949,9 @@ class DepthSession(Session):
         return "\n\n".join("%s\n%s" % sec for sec in self.intro_sections())
 
     def initial_message(self):
-        return ("PHASE 1 - DEPTH LENS: capture 1 of at least %d. Fill the LEFT image with a flat "
+        return ("PHASE %d - DEPTH LENS: capture 1 of at least %d. Fill the LEFT image with a flat "
                 "surface about 50 cm from the camera, no black holes. Press key 1 and keep "
-                "everything still for 5 seconds." % DEPTH_GOOD_CAPTURES)
+                "everything still for 5 seconds." % (phase_number(PH_DEPTH), DEPTH_GOOD_CAPTURES))
 
     def on_helper_loaded(self):
         self.commands.append("sandboxWatch on")
@@ -1031,10 +1066,11 @@ class KinectSession(Session):
 
     def title(self):
         if self.phases == (PH_PLANE, PH_CORNERS):
-            return "Phases 2 and 3: base plane and box corners"
+            return ("Phases %d and %d: base plane and box corners"
+                    % (phase_number(PH_PLANE), phase_number(PH_CORNERS)))
         if self.phases == (PH_PLANE,):
-            return "Phase 2: base plane"
-        return "Phase 3: box corners"
+            return "Phase %d: base plane" % phase_number(PH_PLANE)
+        return "Phase %d: box corners" % phase_number(PH_CORNERS)
 
     def argv(self, paths):
         return [paths.raw_kinect_viewer, "-compress", "0"] + self.vislet_args(paths)
@@ -1049,7 +1085,7 @@ class KinectSession(Session):
                      "\u2022 Instructions pop up inside that window as you go. Click OK (or 'Jolly Good!') to "
                      "dismiss them.")]
         if PH_PLANE in self.phases and self.helper_expected:
-            sections.append(("Phase 2 \u00b7 Base plane",
+            sections.append(("Phase %d \u00b7 Base plane" % phase_number(PH_PLANE),
                              "1. The wizard captures the flat sand by itself right after the window opens "
                              "('Capturing average depth frame...' shows for about 5 seconds). Keep hands out "
                              "until the popup says the sand is captured.\n"
@@ -1058,14 +1094,14 @@ class KinectSession(Session):
                              "Not happy? Drag again: the last rectangle counts. Touched the sand? Click "
                              "'Capture the sand again' in this window first."))
         elif PH_PLANE in self.phases:
-            sections.append(("Phase 2 \u00b7 Base plane",
+            sections.append(("Phase %d \u00b7 Base plane" % phase_number(PH_PLANE),
                              "1. Press and hold the RIGHT mouse button, move onto 'Average Frames' in the menu "
                              "that pops up, and release. Wait until 'Capturing average depth frame...' disappears.\n"
                              "2. Hold down the 1 key and drag a rectangle over a large, flat area of sand in the "
                              "LEFT image, then release the key. Stay inside the sand.\n"
                              "Not happy? Drag again: the last rectangle counts."))
         if PH_CORNERS in self.phases:
-            sections.append(("Phase 3 \u00b7 Box corners",
+            sections.append(("Phase %d \u00b7 Box corners" % phase_number(PH_CORNERS),
                              "Point at each corner of the sand surface in the LEFT image and press the 2 key, "
                              "in this order:\n"
                              "      lower-left \u2192 lower-right \u2192 upper-left \u2192 upper-right\n"
@@ -1079,12 +1115,20 @@ class KinectSession(Session):
     def intro_text(self, ctx=None):
         return "\n\n".join("%s\n%s" % sec for sec in self.intro_sections())
 
+    @property
+    def PLANE_TAG(self):
+        return "PHASE %d - BASE PLANE" % phase_number(PH_PLANE)
+
+    @property
+    def CORNER_TAG(self):
+        return "PHASE %d - CORNERS" % phase_number(PH_CORNERS)
+
     DRAG_PROMPT = ("Hold down key 1 and drag a box over a large, flat area of sand in the LEFT image, "
                    "then release the key.")
 
     def initial_message(self):
         if self.helper_expected:
-            phase = "PHASE 2 - BASE PLANE" if PH_PLANE in self.phases else "PHASE 3 - CORNERS"
+            phase = (self.PLANE_TAG if PH_PLANE in self.phases else self.CORNER_TAG)
             return ("%s: starting up. The flat sand is captured automatically in a moment: keep "
                     "hands and tools out of the box." % phase)
         return self.manual_message()
@@ -1092,9 +1136,10 @@ class KinectSession(Session):
     def manual_message(self):
         """Instructions for the case without the SandboxHelper plugin."""
         if PH_PLANE in self.phases:
-            return ("PHASE 2 - BASE PLANE: hold the right mouse button, pick Average Frames, release. "
-                    "Wait for the capture. Then hold key 1 and drag a box over flat sand in the LEFT image.")
-        return self._corner_prompt("PHASE 3 - CORNERS: ")
+            return ("%s: hold the right mouse button, pick Average Frames, release. "
+                    "Wait for the capture. Then hold key 1 and drag a box over flat sand in the LEFT image."
+                    % self.PLANE_TAG)
+        return self._corner_prompt(self.CORNER_TAG + ": ")
 
     def request_average(self):
         """Ask the plugin to (re)capture the average depth frame. Returns the popup text."""
@@ -1126,7 +1171,7 @@ class KinectSession(Session):
         if PH_PLANE in self.phases:
             return ("Sand captured again. Drag again with key 1 to redo the base plane (the last one "
                     "counts), or carry on.")
-        return self._corner_prompt("Sand captured. PHASE 3 - CORNERS: ")
+        return self._corner_prompt("Sand captured. " + self.CORNER_TAG + ": ")
 
     NO_POPUP_HINT = ("No popup? The camera has no depth at that pixel (it shows black): move a bit "
                      "further onto the sand and press 2 again.")
@@ -1172,7 +1217,7 @@ class KinectSession(Session):
         if PH_CORNERS in self.phases:
             n = len(self.points)
             if n == 0:
-                return self._corner_prompt("PHASE 3 - CORNERS: ")
+                return self._corner_prompt(self.CORNER_TAG + ": ")
             if n % 4:
                 return ("%d of 4 corners so far. NEXT: press 2 on the %s corner. %s"
                         % (n % 4, CORNER_NAMES[n % 4].upper(), self.NO_POPUP_HINT))
@@ -1223,8 +1268,8 @@ class KinectSession(Session):
                 return None
             if PH_CORNERS in self.phases and not self._phase2_prompted:
                 self._phase2_prompted = True
-                return self._corner_prompt("Plane captured (offset %.1f cm). PHASE 3 - CORNERS: "
-                                           % self.plane[3])
+                return self._corner_prompt("Plane captured (offset %.1f cm). %s: "
+                                           % (self.plane[3], self.CORNER_TAG))
             if PH_CORNERS not in self.phases:
                 return ("Plane captured (offset %.1f cm). Press Esc to finish, or drag again "
                         "to redo. The last one counts." % self.plane[3])
@@ -1266,7 +1311,7 @@ class ProjectorSession(Session):
         self.started_at = time.time()
 
     def title(self):
-        return "Phase 4: projector calibration"
+        return "Phase %d: projector calibration" % phase_number(PH_PROJECTOR)
 
     def argv(self, paths):
         return ([paths.calibrate_projector, "-s", str(self.width), str(self.height),
@@ -1297,8 +1342,9 @@ class ProjectorSession(Session):
         return "\n\n".join("%s\n%s" % sec for sec in self.intro_sections())
 
     def initial_message(self):
-        return ("PHASE 4 - PROJECTOR: hold the disk where the white cross is and press key 1. "
-                "Repeat for all %d points. Press key 2 after changing the sand." % NUM_TIE_POINTS)
+        return ("PHASE %d - PROJECTOR: hold the disk where the white cross is and press key 1. "
+                "Repeat for all %d points. Press key 2 after changing the sand."
+                % (phase_number(PH_PROJECTOR), NUM_TIE_POINTS))
 
     def reminder(self):
         if self.rms is not None:
@@ -1337,8 +1383,8 @@ class ProjectorSession(Session):
         if m:
             self.calib_error = m.group(1).strip()
             self.status = "Calibration failed: " + self.calib_error
-            return ("Calibration FAILED: some points were bad. Press Esc, then run Phase 4 "
-                    "again from scratch.")
+            return ("Calibration FAILED: some points were bad. Press Esc, then run Phase %d "
+                    "again from scratch." % phase_number(PH_PROJECTOR))
         return None
 
 
@@ -1614,7 +1660,7 @@ def build_app(paths, log=None, state=None, scale=None):
                                           "This is permanent, like Display Settings: it stays after the wizard "
                                           "closes and after a reboot (the sandbox re-applies it at login).\n\n"
                                           "Everything must be recalibrated afterwards: base plane, box corners "
-                                          "and projector (phases 2 to 4)."):
+                                          "and projector (%s)." % phase_range(CORE_PHASES)):
                 return
             if not set_display_rotation(self.display_output, target, log):
                 messagebox.showerror(APP_TITLE, "The display could not be rotated. See the log for the xrandr error.")
@@ -1666,12 +1712,13 @@ def build_app(paths, log=None, state=None, scale=None):
             for phase in ALL_PHASES:
                 kind = self.phase_kind(phase)
                 active = current is not None and phase in (current if isinstance(current, tuple) else (current,))
+                number = str(phase_number(phase))
                 if active:
-                    fill, outline, fg, txt = C["accent"], C["accent"], C["accent_text"], str(phase)
+                    fill, outline, fg, txt = C["accent"], C["accent"], C["accent_text"], number
                 elif kind == "good":
                     fill, outline, fg, txt = C["good"], C["good"], "#ffffff", "\u2713"
                 else:
-                    fill, outline, fg, txt = C["card"], C["border_strong"], C["muted"], str(phase)
+                    fill, outline, fg, txt = C["card"], C["border_strong"], C["muted"], number
                 canvas.create_oval(x - r, cy - r, x + r, cy + r, fill=fill, outline=outline, width=2)
                 canvas.create_text(x, cy, text=txt, fill=fg, font=self.f_small_b)
                 name = PHASE_NAMES[phase]
@@ -1690,7 +1737,7 @@ def build_app(paths, log=None, state=None, scale=None):
             if kind == "good":
                 fill, fg, txt = C["good"], "#ffffff", "\u2713"
             else:
-                fill, fg, txt = C["accent"], "#ffffff", str(phase)
+                fill, fg, txt = C["accent"], "#ffffff", str(phase_number(phase))
             if text is not None:
                 txt = text
             cv.create_oval(2, 2, size - 2, size - 2, fill=fill, outline=fill)
@@ -1794,7 +1841,7 @@ def build_app(paths, log=None, state=None, scale=None):
                 if info:
                     return ("Edited by hand after %s" % info["done"], "good")
                 return ("Values present  \u00b7  calibrated outside this wizard", "good")
-            # phase 4: projector
+            # the projector phase
             if not os.path.isfile(paths.projector_matrix):
                 return ("Not calibrated yet  \u00b7  no ProjectorMatrix.dat", "warn")
             info = state.get("projector")
@@ -1831,10 +1878,10 @@ def build_app(paths, log=None, state=None, scale=None):
                 delta = 0.0
             return plane, delta, hmp is not None or info is not None, None
 
-        def write_color_height(self, base_plane, delta, live=True):
+        def write_color_height(self, base_plane, delta, live=True, make_backup=True):
             """Persist the colour plane for `delta` in SARndbox.cfg and push it to a running sandbox."""
             hmp = height_map_plane_for(base_plane, delta)
-            backup = backup_file(paths.sandbox_cfg, paths.backup_dir)
+            backup = backup_file(paths.sandbox_cfg, paths.backup_dir) if make_backup else "not repeated"
             write_height_map_plane(paths.sandbox_cfg, hmp)
             state.mark("color_height", delta=delta)
             log.write("Wrote heightMapPlane %s to %s (backup: %s)" % (format_plane(hmp), paths.sandbox_cfg, backup))
@@ -1866,8 +1913,8 @@ def build_app(paths, log=None, state=None, scale=None):
             self.sandbox_bar = self.header(
                 "Color height",
                 "Moves the color bands up or down on the sand without changing the camera calibration. "
-                "Positive raises the sea level (more blue), negative lowers it (more land). A running "
-                "sandbox shows every change immediately; Save keeps it for the next start.")
+                "Positive raises the sea level (more blue), negative lowers it (more land). Every change "
+                "is saved by itself and a running sandbox shows it immediately.")
             self.refresh_sandbox_bar()
             if err or plane is None:
                 self.notice(self.body, "BoxLayout.txt is needed first: " + str(err), "bad")
@@ -1878,6 +1925,7 @@ def build_app(paths, log=None, state=None, scale=None):
             self.ch_saved = delta if in_use else None
             self.ch_value = delta
             self._ch_pending = None
+            self._ch_backed_up = False  # SARndbox.cfg is backed up once per visit, not once per nudge
 
             card = self.card(self.body, padx=self.px(24), pady=self.px(20))
             top = tk.Frame(card, bg=C["card"])
@@ -1911,8 +1959,7 @@ def build_app(paths, log=None, state=None, scale=None):
             self.ch_refresh_hint()
 
             buttons = self.button_row()
-            ttk.Button(buttons, text="Save", style="Primary.TButton", command=self.ch_save).pack(side="left")
-            ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
+            ttk.Button(buttons, text="Back to overview", style="Primary.TButton",
                        command=self.ch_back).pack(side="right")
 
         def ch_refresh_hint(self):
@@ -1921,19 +1968,14 @@ def build_app(paths, log=None, state=None, scale=None):
                 return
             for w in f.winfo_children():
                 w.destroy()
-            running = bool(sandbox_pids(paths.sandbox_process))
-            unsaved = self.ch_saved is None or abs(self.ch_value - self.ch_saved) > 1e-6
-            if running:
+            if bool(sandbox_pids(paths.sandbox_process)):
                 text = "The running sandbox is showing this value. "
+                kind = "good"
             else:
                 text = "The sandbox is not running, so you cannot see the effect yet; launch it to preview. "
-            if unsaved:
-                text += "Not saved yet: press Save to keep it for the next start."
-                kind = "warn"
-            else:
-                text += "Saved in SARndbox.cfg."
-                kind = "good"
-            self.notice(f, text, kind)
+                kind = "info"
+            self.notice(f, text + "Changes are written to SARndbox.cfg as you make them, so they are "
+                        "there at the next start.", kind)
 
         def ch_scale_moved(self, value):
             self.ch_set(round(float(value) * 2.0) / 2.0, from_scale=True)
@@ -1946,32 +1988,31 @@ def build_app(paths, log=None, state=None, scale=None):
             self.ch_display.configure(text=self.format_delta(delta))
             if not from_scale:
                 self.ch_scale_var.set(delta)
-            # push to the sandbox after the slider settles
+            # save and show it once the slider settles, so a drag writes the file once, not per pixel
             if self._ch_pending is not None:
                 self.after_cancel(self._ch_pending)
-            self._ch_pending = self.after(120, self.ch_push_live)
+            self._ch_pending = self.after(250, self.ch_commit)
             self.ch_refresh_hint()
 
-        def ch_push_live(self):
+        def ch_commit(self):
+            """Write the value to SARndbox.cfg and push it to a running sandbox."""
             self._ch_pending = None
-            self.send_color_height_live(self.ch_plane, self.ch_value)
-
-        def ch_save(self):
-            self.write_color_height(self.ch_plane, self.ch_value)
+            if self.ch_saved is not None and abs(self.ch_value - self.ch_saved) < 1e-9:
+                return
+            self.write_color_height(self.ch_plane, self.ch_value, make_backup=not self._ch_backed_up)
+            self._ch_backed_up = True
             self.ch_saved = self.ch_value
             self.ch_refresh_hint()
 
+        def ch_flush(self):
+            """Write a change that is still waiting for the slider to settle."""
+            if getattr(self, "_ch_pending", None) is None:
+                return
+            self.after_cancel(self._ch_pending)
+            self.ch_commit()
+
         def ch_back(self):
-            unsaved = self.ch_saved is None or abs(self.ch_value - self.ch_saved) > 1e-6
-            if unsaved and (self.ch_saved is not None or abs(self.ch_value) > 1e-6):
-                answer = messagebox.askyesnocancel(APP_TITLE, "Keep the new color height (%s)?\n\nYes saves it, "
-                                                              "No puts the previous value back." % self.format_delta(self.ch_value))
-                if answer is None:
-                    return
-                if answer:
-                    self.ch_save()
-                else:
-                    self.send_color_height_live(self.ch_plane, self.ch_saved or 0.0)
+            self.ch_flush()
             self.show_hub()
 
         # ---------------- hub ----------------
@@ -1979,8 +2020,9 @@ def build_app(paths, log=None, state=None, scale=None):
             self.clear()
             self.session = None
             self.sandbox_bar = self.header("Sandbox calibration",
-                                           "Tick the phases to run and press Run. Phases 2 and 3 share one "
-                                           "RawKinectViewer window. Values can be adjusted under Edit values.")
+                                           "Tick the phases to run and press Run. Base plane and box corners "
+                                           "share one RawKinectViewer window. Values can be adjusted under "
+                                           "Edit values.")
             self.refresh_sandbox_bar()
             self.steps(self.body)
 
@@ -1997,7 +2039,7 @@ def build_app(paths, log=None, state=None, scale=None):
                  if corners else "-"),
                 (PH_PROJECTOR, "Aligns the projected image with the camera", "Resolution %dx%d" % self.resolution),
             ]
-            for phase, desc, values in rows:
+            for phase, desc, values in [r for r in rows if r[0] in ALL_PHASES]:
                 status, kind = self.phase_status(phase)
                 var = tk.BooleanVar(value=kind != "good")
                 self.phase_vars[phase] = var
@@ -2008,7 +2050,8 @@ def build_app(paths, log=None, state=None, scale=None):
                 self.badge(cardf, phase, kind, C["card"]).grid(row=0, column=1, sticky="n", padx=(self.px(0), self.px(14)))
                 info = tk.Frame(cardf, bg=C["card"])
                 info.grid(row=0, column=2, sticky="nw")
-                self.label(info, "Phase %d  \u00b7  %s" % (phase, PHASE_NAMES[phase]), font=self.f_h2).pack(anchor="w")
+                self.label(info, "Phase %d  \u00b7  %s" % (phase_number(phase), PHASE_NAMES[phase]),
+                           font=self.f_h2).pack(anchor="w")
                 self.label(info, desc, fg=C["muted"]).pack(anchor="w", pady=(self.px(0), self.px(3)))
                 self.pill(info, status, kind).pack(anchor="w")
                 self.label(cardf, values, font=self.f_mono_small, fg=C["muted_text"]).grid(
@@ -2040,7 +2083,7 @@ def build_app(paths, log=None, state=None, scale=None):
             buttons = self.button_row()
             ttk.Button(buttons, text="Run ticked phases", style="Primary.TButton",
                        command=self.run_ticked).pack(side="left")
-            ttk.Button(buttons, text="Run all 4 phases", style="Secondary.TButton",
+            ttk.Button(buttons, text="Run all %d phases" % len(ALL_PHASES), style="Secondary.TButton",
                        command=lambda: self.start_phases(list(ALL_PHASES))).pack(side="left", padx=(self.px(10), self.px(0)))
             ttk.Button(buttons, text="Edit values", style="Secondary.TButton",
                        command=self.show_editor).pack(side="left", padx=(self.px(10), self.px(0)))
@@ -2472,7 +2515,7 @@ def build_app(paths, log=None, state=None, scale=None):
                 return
             state.data.pop("depth", None)
             state.mark("depth_removed", serial=serial, path=path)
-            log.write("Depth correction removed; phases 2 to 4 need a redo")
+            log.write("Depth correction removed; the other %s need a redo" % phase_range(CORE_PHASES))
             messagebox.showinfo(APP_TITLE, "Deleted. A copy is in %s" % (info or paths.backup_dir))
             after()
 
@@ -2527,9 +2570,10 @@ def build_app(paths, log=None, state=None, scale=None):
                 info = state.get("depth")
                 if not info or abs(info.get("mtime", -1) - mtime) >= 1.0:
                     state.mark("depth", serial=serial or s.serial, captures=s.captures, mtime=mtime, path=path)
-                    log.write("Depth correction %s written with %d captures; phases 2 to 4 need a redo"
-                              % (path, s.captures))
-                notes.append("Phases 2 to 4 are now marked for a redo: every depth reading has changed.")
+                    log.write("Depth correction %s written with %d captures; the other %s need a redo"
+                              % (path, s.captures, phase_range(CORE_PHASES)))
+                notes.append("The other %s are now marked for a redo: every depth reading has changed."
+                             % phase_range(CORE_PHASES))
             c = self.card(self.body)
             self.label(c, "Depth lens correction", font=self.f_h2).pack(anchor="w")
             row = tk.Frame(c, bg=C["card"])
@@ -2808,6 +2852,7 @@ def build_app(paths, log=None, state=None, scale=None):
 
         # ---------------- close ----------------
         def on_close(self):
+            self.ch_flush()
             if self.runner is not None and self.runner.running():
                 if not messagebox.askyesno(APP_TITLE, "%s is still running. Stop it and quit?" % self.session.tool_name):
                     return
