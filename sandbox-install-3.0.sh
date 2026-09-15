@@ -9,9 +9,12 @@
 #                   sandbox calibration (BoxLayout.txt and ProjectorMatrix.dat). Every file the
 #                   payload replaces is copied to ~/sandbox-backup-<date> first. Safe to re-run.
 #
-# Usage:
-#   wget -O sandbox-install-3.0.sh https://github.com/ideafablabs/sandbox/raw/main/sandbox-install-3.0.sh
-#   bash sandbox-install-3.0.sh [options]
+# Usage: one line, pasted into a terminal as the normal user (it asks for the sudo
+# password itself where it needs root):
+#
+#   wget -O sandbox-install-3.0.sh https://github.com/ideafablabs/sandbox/raw/main/sandbox-install-3.0.sh && chmod +x sandbox-install-3.0.sh && ./sandbox-install-3.0.sh
+#
+# Add any of the options below to that last part, e.g. ./sandbox-install-3.0.sh --payload-only
 #
 # Options:
 #   --payload-only         only refresh the payload (no builds, no camera calibration)
@@ -43,7 +46,7 @@ while [ $# -gt 0 ]; do
         --skip-settings)      SKIP_SETTINGS=1 ;;
         --local-payload)      shift; LOCAL_PAYLOAD=$(readlink -f "$1") ;;
         --icon-zoom)          shift; DESKTOP_ICON_ZOOM=$1 ;;
-        -h|--help)            sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)            sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift

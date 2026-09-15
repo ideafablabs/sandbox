@@ -10,12 +10,16 @@ scripts. The UC Davis code itself is not modified.
 
 ## Fresh install
 
-On a new Linux Mint (Cinnamon) machine, logged in as the `sandbox` user:
+On a new Linux Mint (Cinnamon) machine, logged in as the `sandbox` user, paste
+this one line into a terminal:
 
 ```
-wget -O sandbox-install-3.0.sh https://github.com/ideafablabs/sandbox/raw/main/sandbox-install-3.0.sh
-bash sandbox-install-3.0.sh
+wget -O sandbox-install-3.0.sh https://github.com/ideafablabs/sandbox/raw/main/sandbox-install-3.0.sh && chmod +x sandbox-install-3.0.sh && ./sandbox-install-3.0.sh
 ```
+
+It downloads the install script, makes it executable and runs it. Run it as the
+normal user, not with `sudo`: it asks for the password itself where it needs
+root.
 
 It builds Vrui, Kinect and SARndbox, asks you to plug in the camera for the
 intrinsic calibration, installs the payload and applies the desktop settings:
@@ -27,7 +31,7 @@ that the background really took and says so in its summary. Use
 
 ## Updating an existing install
 
-Run the same two commands again on the sandbox PC. The script detects what is
+Paste the same line again on the sandbox PC. The script detects what is
 already there:
 
 - Vrui, Kinect and SARndbox are skipped when their binaries exist
@@ -41,10 +45,11 @@ already there:
   are removed and `python3-tk` is installed if missing.
 
 To refresh only the icons, scripts and wizard without touching the builds or the
-camera, use:
+camera, add `--payload-only`, which is the usual way to pick up a change to the
+wizard:
 
 ```
-bash sandbox-install-3.0.sh --payload-only
+wget -O sandbox-install-3.0.sh https://github.com/ideafablabs/sandbox/raw/main/sandbox-install-3.0.sh && chmod +x sandbox-install-3.0.sh && ./sandbox-install-3.0.sh --payload-only
 ```
 
 Other options: `--skip-settings` leaves the Cinnamon settings alone and
