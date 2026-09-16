@@ -22,12 +22,29 @@ normal user, not with `sudo`: it asks for the password itself where it needs
 root.
 
 It builds Vrui, Kinect and SARndbox, asks you to plug in the camera for the
-intrinsic calibration, installs the payload and applies the desktop settings:
-screensaver and display sleep off, sounds off, the `ifl-desktop-bg.png`
-background, and larger desktop icons with bigger labels. The settings work on
-Cinnamon (and MATE or GNOME if that is what the machine runs); the script checks
-that the background really took and says so in its summary. Use
-`--icon-zoom largest` (or `standard`, `large`, `larger`) to change the icon size.
+intrinsic calibration, installs the payload and sets the machine up to run
+unattended:
+
+- **The screen never goes dark.** Screensaver and screen lock off, no display
+  sleep or dimming, and the computer never suspends on its own. X's own blanking
+  and DPMS are turned off as well, by `bin/disable-screen-blanking.sh`, which
+  runs from a login autostart entry and again at the start of `run-sandbox.sh`,
+  because those come back every time the X server restarts.
+- **The account logs in automatically.** The user that ran the installer is
+  written into `/etc/lightdm/lightdm.conf` under `[Seat:*]`, so the machine comes
+  back up into the desktop by itself after a power cut. The file as it was before
+  the first run is kept as `lightdm.conf.sandbox-orig`.
+- **The power button turns the computer off** when pressed, with no dialog.
+- Sounds off, the `ifl-desktop-bg.png` background, and larger desktop icons with
+  bigger labels.
+
+The settings work on Cinnamon (and MATE or GNOME if that is what the machine
+runs). Every setting is read back after it is written, and the summary at the end
+says what the screensaver and power button actually read, names anything that did
+not stick and anything the installed release does not have. If a setting is ever
+lost, re-run the script and read that summary. Use `--icon-zoom largest` (or
+`standard`, `large`, `larger`) to change the icon size, and `--skip-settings` to
+leave all of the above alone.
 
 ## Updating an existing install
 

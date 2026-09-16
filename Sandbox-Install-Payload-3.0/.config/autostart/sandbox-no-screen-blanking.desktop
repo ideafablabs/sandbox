@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Exec=/home/sandbox/src/SARndbox-2.8/bin/disable-screen-blanking.sh
+Hidden=false
+X-MATE-Autostart-enabled=true
+Name[en_US]=sandbox-no-screen-blanking
+Name=sandbox-no-screen-blanking
+Comment[en_US]=Stop X blanking the screen or sleeping the projector
+Comment=Stop X blanking the screen or sleeping the projector

@@ -20,7 +20,7 @@
 #   --payload-only         only refresh the payload (no builds, no camera calibration)
 #   --force-build          rebuild Vrui, Kinect and SARndbox even if they are installed
 #   --recalibrate-camera   run "KinectUtil getCalib" again even if calibration data exists
-#   --skip-settings        leave the Cinnamon screensaver / power / background settings alone
+#   --skip-settings        leave the screensaver, power, background and auto-login settings alone
 #   --local-payload FILE   use a local payload tarball instead of downloading it
 #   --icon-zoom LEVEL      desktop icon size: standard, large, larger (default) or largest
 #   -h, --help             show this text
@@ -213,7 +213,26 @@ fi
 BG_IMAGE=$HOME/Pictures/ifl-desktop-bg.png
 
 has_schema() { gsettings list-schemas 2>/dev/null | grep -qx "$1"; }
-gs() { gsettings set "$@" 2>/dev/null; }
+has_key()    { gsettings list-keys "$1" 2>/dev/null | grep -qx "$2"; }
+GS_FAILED=""; GS_MISSING=""
+# gs <schema> <key> <value>: set it, then read it back. Writing settings into the wrong
+# session, or a key this Mint release does not have, used to fail silently; now it is named
+# in the summary.
+gs() {
+    local schema=$1 key=$2 value=$3 now quoted
+    if ! has_key "$schema" "$key"; then
+        GS_MISSING="${GS_MISSING:+$GS_MISSING, }$key"
+        return 1
+    fi
+    gsettings set "$schema" "$key" "$value" 2>/dev/null
+    now=$(gsettings get "$schema" "$key" 2>/dev/null)
+    quoted="'$value'"          # gsettings prints strings and enums quoted
+    if [ "$now" = "$value" ] || [ "$now" = "$quoted" ] || [ "$now" = "uint32 $value" ]; then
+        return 0
+    fi
+    GS_FAILED="${GS_FAILED:+$GS_FAILED, }$key"
+    return 1
+}
 
 zoom_number() {   # zoom name -> number used in nemo's desktop-metadata file
     case "$1" in
@@ -274,12 +293,22 @@ if [ $SKIP_SETTINGS -eq 0 ] && command -v gsettings >/dev/null 2>&1; then
     APPLIED=""
 
     if has_schema org.cinnamon.desktop.background; then                     # Cinnamon
+        # screensaver and lock screen off
         gs org.cinnamon.desktop.screensaver idle-activation-enabled false
         gs org.cinnamon.desktop.screensaver lock-enabled false
+        gs org.cinnamon.desktop.session idle-delay 0
+        # the display never sleeps or dims
         gs org.cinnamon.settings-daemon.plugins.power sleep-display-ac 0
         gs org.cinnamon.settings-daemon.plugins.power sleep-display-battery 0
+        gs org.cinnamon.settings-daemon.plugins.power idle-dim-ac false
+        gs org.cinnamon.settings-daemon.plugins.power idle-dim-battery false
+        # and the machine itself never suspends when nobody touches it
+        gs org.cinnamon.settings-daemon.plugins.power sleep-inactive-ac-timeout 0
+        gs org.cinnamon.settings-daemon.plugins.power sleep-inactive-battery-timeout 0
+        gs org.cinnamon.settings-daemon.plugins.power sleep-inactive-ac-type nothing
+        gs org.cinnamon.settings-daemon.plugins.power sleep-inactive-battery-type nothing
+        # a press of the power button turns the computer off, without asking
         gs org.cinnamon.settings-daemon.plugins.power button-power shutdown
-        gs org.cinnamon.desktop.session idle-delay 0
         gs org.cinnamon.desktop.sound volume-sound-enabled false
         gs org.cinnamon.desktop.background picture-options zoom
         gs org.cinnamon.desktop.background picture-uri "file://$BG_IMAGE"
@@ -289,6 +318,8 @@ if [ $SKIP_SETTINGS -eq 0 ] && command -v gsettings >/dev/null 2>&1; then
         gs org.mate.screensaver idle-activation-enabled false
         gs org.mate.screensaver lock-enabled false
         gs org.mate.power-manager sleep-display-ac 0
+        gs org.mate.power-manager sleep-computer-ac 0
+        gs org.mate.power-manager button-power shutdown
         gs org.mate.session idle-delay 0
         gs org.mate.background picture-options zoom
         gs org.mate.background picture-filename "$BG_IMAGE"
@@ -328,6 +359,24 @@ if [ $SKIP_SETTINGS -eq 0 ] && command -v gsettings >/dev/null 2>&1; then
     elif has_schema org.gnome.desktop.background; then
         BG_NOW=$(gsettings get org.gnome.desktop.background picture-uri 2>/dev/null)
     fi
+    # Say what the screensaver and power button actually read now, so a setting that did not
+    # stick is visible in the summary instead of being discovered months later.
+    if has_schema org.cinnamon.desktop.screensaver; then
+        SS_NOW=$(gsettings get org.cinnamon.desktop.screensaver idle-activation-enabled 2>/dev/null)
+        PB_NOW=$(gsettings get org.cinnamon.settings-daemon.plugins.power button-power 2>/dev/null)
+        if [ "$SS_NOW" = "false" ]; then
+            note "Screensaver:        off; screen and computer never sleep"
+        else
+            note "Screensaver:        STILL ON (idle-activation-enabled reads ${SS_NOW:-nothing})"
+        fi
+        if [ "$PB_NOW" = "'shutdown'" ]; then
+            note "Power button:       turns the computer off when pressed"
+        else
+            note "Power button:       NOT set to shut down (reads ${PB_NOW:-nothing})"
+        fi
+    fi
+    [ -n "$GS_FAILED" ]  && note "Settings that did NOT stick: $GS_FAILED"
+    [ -n "$GS_MISSING" ] && note "Settings this release does not have: $GS_MISSING (ignored)"
     if [ -z "$APPLIED" ]; then
         note "Desktop settings:   no Cinnamon, MATE or GNOME settings found; nothing applied"
     elif [ ! -f "$BG_IMAGE" ]; then
@@ -339,6 +388,73 @@ if [ $SKIP_SETTINGS -eq 0 ] && command -v gsettings >/dev/null 2>&1; then
     fi
 else
     note "Desktop settings:   skipped"
+fi
+
+# ---------------------------------------------------------------------- automatic login
+# The sandbox PC is a kiosk: after a power cut it has to come back up into the desktop on
+# its own, so the sandbox and the login autostart entries run without anybody typing a
+# password. LightDM reads /etc/lightdm/lightdm.conf last, so what is written there wins over
+# the packaged drop-ins in lightdm.conf.d.
+LIGHTDM_CONF=/etc/lightdm/lightdm.conf
+AUTOLOGIN_USER=$(id -un)
+if [ $SKIP_SETTINGS -ne 0 ]; then
+    note "Automatic login:    skipped (--skip-settings)"
+elif [ ! -d /etc/lightdm ]; then
+    note "Automatic login:    skipped (this machine does not use LightDM)"
+else
+    say "Setting $AUTOLOGIN_USER to log in automatically"
+    if [ -f "$LIGHTDM_CONF" ] && [ ! -f "$LIGHTDM_CONF.sandbox-orig" ]; then
+        sudo cp -a "$LIGHTDM_CONF" "$LIGHTDM_CONF.sandbox-orig" 2>/dev/null \
+            && note "LightDM backup:     $LIGHTDM_CONF.sandbox-orig (as it was before the first run)"
+    fi
+    sudo python3 - "$LIGHTDM_CONF" "$AUTOLOGIN_USER" <<'PYEOF3'
+import os, re, sys
+
+path, user = sys.argv[1], sys.argv[2]
+want = [("autologin-user", user), ("autologin-user-timeout", "0"), ("autologin-guest", "false")]
+try:
+    lines = open(path).read().splitlines()
+except OSError:
+    lines = []
+
+# find [Seat:*], adding it at the end when the file has none
+start = None
+for i, line in enumerate(lines):
+    if line.strip() == "[Seat:*]":
+        start = i
+        break
+if start is None:
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.append("[Seat:*]")
+    start = len(lines) - 1
+end = len(lines)
+for i in range(start + 1, len(lines)):
+    if lines[i].lstrip().startswith("["):
+        end = i
+        break
+
+# drop every existing (or commented out) copy of the three keys, then write them once
+patterns = [re.compile(r"^\s*#?\s*%s\s*=" % re.escape(key)) for key, _ in want]
+section = [l for l in lines[start + 1:end] if not any(p.match(l) for p in patterns)]
+while section and not section[-1].strip():
+    section.pop()
+section += ["%s=%s" % (key, value) for key, value in want]
+if end < len(lines):
+    section.append("")  # keep a blank line before the next section
+lines[start + 1:end] = section
+
+tmp = path + ".sandbox-tmp"
+with open(tmp, "w") as f:
+    f.write("\n".join(lines).rstrip("\n") + "\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PYEOF3
+    if sudo grep -qx "autologin-user=$AUTOLOGIN_USER" "$LIGHTDM_CONF" 2>/dev/null; then
+        note "Automatic login:    $AUTOLOGIN_USER (in $LIGHTDM_CONF)"
+    else
+        note "Automatic login:    FAILED - add autologin-user=$AUTOLOGIN_USER under [Seat:*] in $LIGHTDM_CONF"
+    fi
 fi
 
 # ---------------------------------------------------------------------- summary
