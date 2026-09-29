@@ -6,6 +6,7 @@ calibration tools.
 Base plane   (RawKinectViewer, "Extract Planes" tool on key 1)
 Box corners  (RawKinectViewer, "Measure 3D Positions" tool on key 2)
 Projector    (CalibrateProjector, "Capture" tool on keys 1 and 2)
+Edge mask    (SandboxMask plug-in in the running sandbox, nudged from the wizard)
 Depth lens   (RawKinectViewer, "Calibrate Depth Lens" tool on keys 1 and 2), hidden
              unless SANDBOX_CALIB_DEPTH=1; it then comes first and renumbers the rest.
 
@@ -14,6 +15,15 @@ instructions into their window through the Vrui command interface on stdin
 ("showMessage ..." / "quit"), parses what they print, validates the numbers,
 backs up the old files and writes BoxLayout.txt.  CalibrateProjector writes
 ProjectorMatrix.dat itself; the wizard only checks that it did.
+
+The edge mask phase blacks out everything the projector draws outside the box.
+The SandboxMask plug-in (../SandboxMask/, loaded by run-sandbox.sh) projects the
+measured corners through ProjectorMatrix.dat, grows the rectangle by a margin per
+edge and fills the rest of the screen with black. The wizard writes the margins to
+etc/SARndbox-2.8/EdgeMask.cfg as they are nudged; the plug-in re-reads the file
+within half a second, so a running sandbox shows every change, with the edge being
+adjusted drawn in yellow. The mask is recomputed from the calibration files at
+every start, so redoing the corners or the projector never breaks it.
 
 The base plane and box corners share one RawKinectViewer session when both are
 selected. Phases are numbered on screen by their position in ALL_PHASES, so the
@@ -41,16 +51,19 @@ Paths can be overridden with environment variables (used for testing):
   SANDBOX_CALIB_CONTROL_FIFO        default <sarndbox>/share/SARndbox-2.8/Control.fifo
   SANDBOX_CALIB_KINECT_ETC_DIR      default /usr/local/etc/Vrui-8.0/Kinect-3.10
   SANDBOX_CALIB_DEPTH               1 shows the depth lens phase (hidden by default)
+  SANDBOX_CALIB_MASK_VISLET         path of libSandboxMask.so, or none (default: search Vrui's VRVislets)
 """
 
 import argparse
 import datetime
 import glob
 import json
+import math
 import os
 import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -64,11 +77,12 @@ DEFAULT_SCALE = 0.66  # the wizard draws inside a centred panel this fraction of
 
 # Internal phase ids. What the user sees is the position in ALL_PHASES, so hiding a phase
 # renumbers the rest; never print these.
-PH_DEPTH, PH_PLANE, PH_CORNERS, PH_PROJECTOR = 0, 1, 2, 3
-PHASE_NAMES = {PH_DEPTH: "Depth lens", PH_PLANE: "Base plane", PH_CORNERS: "Box corners", PH_PROJECTOR: "Projector"}
-CORE_PHASES = (PH_PLANE, PH_CORNERS, PH_PROJECTOR)
-PHASE_ORDER = (PH_DEPTH,) + CORE_PHASES
-ALL_PHASES = CORE_PHASES  # set_depth_phase() rewrites this
+PH_DEPTH, PH_PLANE, PH_CORNERS, PH_PROJECTOR, PH_MASK = 0, 1, 2, 3, 4
+PHASE_NAMES = {PH_DEPTH: "Depth lens", PH_PLANE: "Base plane", PH_CORNERS: "Box corners", PH_PROJECTOR: "Projector",
+               PH_MASK: "Edge mask"}
+CORE_PHASES = (PH_PLANE, PH_CORNERS, PH_PROJECTOR)  # the camera and projector calibration; a flip or depth redo invalidates these
+PHASE_ORDER = (PH_DEPTH,) + CORE_PHASES + (PH_MASK,)
+ALL_PHASES = CORE_PHASES + (PH_MASK,)  # set_depth_phase() rewrites this
 
 
 def set_depth_phase(enabled):
@@ -76,7 +90,7 @@ def set_depth_phase(enabled):
     several distances, is only worth doing once per camera, and the wizard is normally used for
     the three phases that follow. SANDBOX_CALIB_DEPTH=1 brings it back as the first phase."""
     global ALL_PHASES
-    ALL_PHASES = PHASE_ORDER if enabled else CORE_PHASES
+    ALL_PHASES = PHASE_ORDER if enabled else CORE_PHASES + (PH_MASK,)
 
 
 def depth_phase_enabled():
@@ -189,6 +203,19 @@ class Paths:
         self.rotation_file = os.path.join(self.etc_dir, "display-rotation")
         # Vrui tool bindings for phase 1 (DEPTH_TOOLS_CFG), written before RawKinectViewer starts
         self.depth_tools_cfg = os.path.join(self.etc_dir, "DepthLensTools.cfg")
+        # Edge mask margins for the SandboxMask plug-in (../SandboxMask/), which run-sandbox.sh loads
+        self.edge_mask = os.path.join(self.etc_dir, "EdgeMask.cfg")
+        self.mask_vislet = env("SANDBOX_CALIB_MASK_VISLET", "")
+        if self.mask_vislet.lower() in ("none", "off"):
+            self.mask_vislet = ""
+        elif not self.mask_vislet:
+            for pattern in ("/usr/local/lib/*/Vrui-8.0/VRVislets/libSandboxMask.so",
+                            "/usr/local/lib/Vrui-8.0/VRVislets/libSandboxMask.so",
+                            "/usr/local/lib64/Vrui-8.0/VRVislets/libSandboxMask.so"):
+                hits = glob.glob(pattern)
+                if hits:
+                    self.mask_vislet = hits[0]
+                    break
 
     def check(self):
         """Return a list of (label, path, ok) tuples for the --check option."""
@@ -205,6 +232,8 @@ class Paths:
             ("ProjectorMatrix.dat", self.projector_matrix, os.path.isfile(self.projector_matrix)),
             ("Control.fifo", self.control_fifo, os.path.exists(self.control_fifo)),
             ("SandboxHelper plugin", self.vislet or "not installed: Average Frames is picked by hand", True),
+            ("SandboxMask plugin", self.mask_vislet or "not installed: the sandbox shows no edge mask", True),
+            ("EdgeMask.cfg", self.edge_mask if os.path.isfile(self.edge_mask) else "none (no edge mask yet)", True),
             ("Kinect config dir", self.kinect_etc_dir, os.path.isdir(self.kinect_etc_dir)),
             ("  writable", "yes" if kinect_etc_writable(self.kinect_etc_dir)
              else "no: the depth lens phase offers to fix it (pkexec)", True),
@@ -416,6 +445,185 @@ def write_box_layout(path, plane, corners):
     with open(tmp, "w") as f:
         f.write(text)
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# Edge mask: EdgeMask.cfg for the SandboxMask plug-in, and the same geometry the
+# plug-in computes (SandboxMask/MaskGeometry.h) so the wizard can draw it.
+# Edges are named after the corners in BoxLayout.txt as the camera sees them:
+# left = LL-UL, right = LR-UR, bottom = LL-LR, top = UL-UR. On screen they may
+# land anywhere, so the wizard labels them by where they appear (screen_edge_labels).
+# --------------------------------------------------------------------------
+
+MASK_EDGES = ("left", "right", "bottom", "top")
+MASK_EDGE_CORNERS = {"left": (0, 2), "right": (1, 3), "bottom": (0, 1), "top": (2, 3)}
+MASK_CORNER_EDGES = (("left", "bottom"), ("right", "bottom"), ("left", "top"), ("right", "top"))  # LL, LR, UL, UR
+MASK_LABELS = ("Top", "Left", "Right", "Bottom")  # row order on the wizard screen
+MASK_LIMIT = 30.0  # cm either way
+MASK_HIGHLIGHT_SECONDS = 30  # the plug-in keeps a highlight from the file this long after it was written
+
+
+def read_projector_matrix(path):
+    """The 4x4 projector matrix CalibrateProjector writes: 16 little-endian doubles, row-major."""
+    with open(path, "rb") as f:
+        data = f.read(128)
+    if len(data) != 128:
+        raise ValueError("%s should be 128 bytes (16 doubles), is %d" % (path, len(data)))
+    return struct.unpack("<16d", data)
+
+
+def read_edge_mask(path):
+    """Return {"enabled": bool, "margins": {edge: cm}, "highlight": edge or None}.
+    Raises OSError when the file is missing and ValueError when it is garbled."""
+    margins = dict((e, 0.0) for e in MASK_EDGES)
+    enabled = True
+    highlight = None
+    with open(path) as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            key = parts[0]
+            value = parts[1].strip() if len(parts) > 1 else ""
+            if key == "enabled":
+                enabled = value.lower() not in ("0", "off", "false", "no")
+            elif key in MASK_EDGES:
+                try:
+                    margins[key] = float(value)
+                except ValueError:
+                    raise ValueError("%s: %s needs a number, not %r" % (path, key, value))
+            elif key == "highlight":
+                highlight = value if value in MASK_EDGES else None
+    return {"enabled": enabled, "margins": margins, "highlight": highlight}
+
+
+def write_edge_mask(path, margins, enabled, highlight=None):
+    lines = ["# Edge mask for the SandboxMask plug-in, written by Calibrate Sandbox",
+             "# Margins in cm outside the measured box corners: positive shows more, negative hides more.",
+             "# Edges are named as the camera sees the corners (left = lower-left to upper-left, ...).",
+             "enabled %d" % (1 if enabled else 0)]
+    for e in MASK_EDGES:
+        lines.append("%s %.6g" % (e, margins.get(e, 0.0)))
+    if highlight in MASK_EDGES:
+        lines.append("highlight %s  # outline shown for %d s after this file was written" % (highlight, MASK_HIGHLIGHT_SECONDS))
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def _vsub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _vdot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vcross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _vnorm(a):
+    m = math.sqrt(_vdot(a, a))
+    return (a[0] / m, a[1] / m, a[2] / m) if m > 0 else a
+
+
+def plane_project(plane, p):
+    """Drop a point onto the base plane (nx, ny, nz, off), as SARndbox does with the corners."""
+    n = plane[:3]
+    d = (_vdot(n, p) - plane[3]) / _vdot(n, n)
+    return (p[0] - n[0] * d, p[1] - n[1] * d, p[2] - n[2] * d)
+
+
+def mask_corners(plane, corners, margins):
+    """The four corners with each edge moved outwards by its margin (cm), on the base plane,
+    in BoxLayout.txt order. Mirrors MaskGeometry::maskCorners; raises ValueError."""
+    n = _vnorm(plane[:3])
+    c = [plane_project(plane, p) for p in corners]
+    center = tuple(sum(p[i] for p in c) / 4.0 for i in range(3))
+    x = tuple((c[1][i] - c[0][i]) + (c[3][i] - c[2][i]) for i in range(3))
+    xn = _vdot(x, n)
+    x = tuple(x[i] - n[i] * xn for i in range(3))
+    if math.sqrt(_vdot(x, x)) < 1e-6:
+        raise ValueError("the corners do not span a rectangle")
+    x = _vnorm(x)
+    y = _vnorm(_vcross(n, x))
+    uv = [(_vdot(_vsub(p, center), x), _vdot(_vsub(p, center), y)) for p in c]
+    lines = {}
+    for e in MASK_EDGES:
+        a, b = MASK_EDGE_CORNERS[e]
+        dx, dy = uv[b][0] - uv[a][0], uv[b][1] - uv[a][1]
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            raise ValueError("the two corners of the %s edge coincide" % e)
+        dx, dy = dx / length, dy / length
+        nx, ny = dy, -dx
+        mx, my = (uv[a][0] + uv[b][0]) / 2.0, (uv[a][1] + uv[b][1]) / 2.0
+        if nx * mx + ny * my < 0:
+            nx, ny = -nx, -ny
+        m = margins.get(e, 0.0)
+        lines[e] = ((uv[a][0] + nx * m, uv[a][1] + ny * m), (dx, dy))
+    out = []
+    for e1, e2 in MASK_CORNER_EDGES:
+        (p1, d1), (p2, d2) = lines[e1], lines[e2]
+        den = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(den) < 1e-12:
+            raise ValueError("the %s and %s edges are parallel" % (e1, e2))
+        t = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / den
+        u, v = p1[0] + d1[0] * t, p1[1] + d1[1] * t
+        out.append(tuple(center[i] + x[i] * u + y[i] * v for i in range(3)))
+    return out
+
+
+def project_point(matrix, p):
+    """Camera-space point through the projector matrix to normalized device coordinates
+    (x, y, z in -1..1), or None when the point is behind the projector."""
+    clip = [matrix[i * 4] * p[0] + matrix[i * 4 + 1] * p[1] + matrix[i * 4 + 2] * p[2] + matrix[i * 4 + 3]
+            for i in range(4)]
+    if clip[3] <= 1e-12:
+        return None
+    return (clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3])
+
+
+def mask_screen_corners(plane, corners, margins, matrix):
+    """The mask outline on screen: four (x, y) in -1..1, BoxLayout.txt order. Raises ValueError."""
+    result = []
+    for p in mask_corners(plane, corners, margins):
+        ndc = project_point(matrix, p)
+        if ndc is None:
+            raise ValueError("a mask corner lies behind the projector; check the projector calibration")
+        result.append(ndc[:2])
+    return result
+
+
+def screen_edge_labels(screen_corners):
+    """{edge: "Left"/"Right"/"Bottom"/"Top"} by where each edge lands on the screen, so the
+    operator can be told which edge moves. Falls back to the camera names if ambiguous."""
+    mids = {}
+    for e in MASK_EDGES:
+        a, b = MASK_EDGE_CORNERS[e]
+        mids[e] = ((screen_corners[a][0] + screen_corners[b][0]) / 2.0,
+                   (screen_corners[a][1] + screen_corners[b][1]) / 2.0)
+    scores = []
+    for e, (mx, my) in mids.items():
+        scores += [(-mx, "Left", e), (mx, "Right", e), (-my, "Bottom", e), (my, "Top", e)]
+    scores.sort(reverse=True)
+    labels, used = {}, set()
+    for _, label, e in scores:
+        if e not in labels and label not in used:
+            labels[e] = label
+            used.add(label)
+    if len(labels) != 4:
+        return dict((e, e.capitalize()) for e in MASK_EDGES)
+    return labels
+
+
+def format_cm(value):
+    if abs(value) < 0.05:
+        return "0 cm"
+    return "%+.1f cm" % value
 
 
 # --------------------------------------------------------------------------
@@ -1468,6 +1676,8 @@ def build_app(paths, log=None, state=None, scale=None):
             self.resolution = detect_resolution()
             self.display_output, self.display_rotation = detect_display()
             self.xbg_proc = None
+            self.compact = None  # window state saved while the edge mask screen shrinks the window
+            self.mk_active = False
             self.show_hub()
             self.after(200, self._poll)
 
@@ -1573,6 +1783,8 @@ def build_app(paths, log=None, state=None, scale=None):
 
         # ---------------- building blocks ----------------
         def clear(self):
+            self.mask_flush()
+            self.leave_compact()
             for w in self.body.winfo_children():
                 w.destroy()
             self.log_widget = None
@@ -1606,16 +1818,17 @@ def build_app(paths, log=None, state=None, scale=None):
             f = tk.Frame(parent, bg=bg)
             if pack:
                 f.pack(fill="x", pady=(self.px(0), self.px(8)))
-            tk.Label(f, text=prefix + text, bg=bg, fg=fg, font=self.f_body, wraplength=self.px(880), justify="left",
+            wrap = self.px(700 if getattr(self, "compact", None) is not None else 880)  # the edge mask panel is narrow
+            tk.Label(f, text=prefix + text, bg=bg, fg=fg, font=self.f_body, wraplength=wrap, justify="left",
                      padx=self.px(14), pady=self.px(10)).pack(anchor="w")
             return f
 
-        def header(self, title, subtitle=None):
+        def header(self, title, subtitle=None, compact=False):
             row = tk.Frame(self.body, bg=C["bg"])
             row.pack(fill="x")
             right = tk.Frame(row, bg=C["bg"])
             right.pack(side="right", anchor="ne", padx=(self.px(16), self.px(0)))
-            if self.display_output:
+            if self.display_output and not compact:
                 self.flip_button = ttk.Button(right, command=self.flip_toggle)
                 self.flip_button.pack(side="right", padx=(self.px(10), self.px(0)))
                 self.refresh_flip_button()
@@ -1841,6 +2054,8 @@ def build_app(paths, log=None, state=None, scale=None):
                 if info:
                     return ("Edited by hand after %s" % info["done"], "good")
                 return ("Values present  \u00b7  calibrated outside this wizard", "good")
+            if phase == PH_MASK:
+                return self.mask_status()
             # the projector phase
             if not os.path.isfile(paths.projector_matrix):
                 return ("Not calibrated yet  \u00b7  no ProjectorMatrix.dat", "warn")
@@ -2015,6 +2230,417 @@ def build_app(paths, log=None, state=None, scale=None):
             self.ch_flush()
             self.show_hub()
 
+        # ---------------- edge mask (black outside the box) ----------------
+        def mask_state(self):
+            """(margins, enabled, exists, error) from EdgeMask.cfg."""
+            zero = dict((e, 0.0) for e in MASK_EDGES)
+            try:
+                cfg = read_edge_mask(paths.edge_mask)
+            except OSError:
+                return zero, True, False, None
+            except ValueError as e:
+                return zero, True, True, str(e)
+            return cfg["margins"], cfg["enabled"], True, None
+
+        def mask_geometry(self, margins):
+            """(screen_corners, labels, error) for the current calibration files."""
+            plane, corners, err = self.layout_values()
+            if err:
+                return None, None, "BoxLayout.txt is needed first: " + err
+            try:
+                matrix = read_projector_matrix(paths.projector_matrix)
+            except (OSError, ValueError) as e:
+                return None, None, "ProjectorMatrix.dat is needed first: %s" % e
+            try:
+                sc = mask_screen_corners(plane, corners, margins, matrix)
+            except ValueError as e:
+                return None, None, str(e)
+            return sc, screen_edge_labels(sc), None
+
+        def mask_prerequisites(self):
+            """Names of the phases still at factory defaults that the mask is computed from, or []."""
+            return [PHASE_NAMES[p] for p in (PH_CORNERS, PH_PROJECTOR) if self.phase_kind(p) == "warn"]
+
+        def mask_labels(self):
+            margins, _, _, _ = self.mask_state()
+            sc, labels, err = self.mask_geometry(margins)
+            return labels or dict((e, e.capitalize()) for e in MASK_EDGES)
+
+        def mask_values_text(self):
+            margins, enabled, exists, err = self.mask_state()
+            if not exists or err:
+                return "-"
+            labels = self.mask_labels()
+            by_label = dict((labels[e], margins[e]) for e in MASK_EDGES)
+            lines = ["%-8s %s" % (label + ":", format_cm(by_label[label])) for label in MASK_LABELS if label in by_label]
+            return "\n".join(lines)
+
+        def mask_status(self):
+            margins, enabled, exists, err = self.mask_state()
+            if err:
+                return ("EdgeMask.cfg unreadable: " + err, "bad")
+            missing = self.mask_prerequisites()
+            if not exists:
+                text = "Not set up yet  \u00b7  the picture reaches past the box walls"
+                if missing:
+                    text += "  \u00b7  needs %s first" % " and ".join(missing)
+                return (text, "warn")
+            info = state.get("mask")
+            when = ("  \u00b7  " + info["done"]) if info and info.get("done") else ""
+            if not enabled:
+                return ("Off%s  \u00b7  the margins are kept" % when, "warn")
+            if not paths.mask_vislet:
+                return ("On%s  \u00b7  but the SandboxMask plug-in is not installed: run the installer" % when, "bad")
+            return ("On%s  \u00b7  follows the corners and projector automatically" % when, "good")
+
+        def enter_compact(self):
+            """Shrink to a small always-on-top panel so the sandbox stays visible around it."""
+            if self.compact is not None:
+                return
+            self.compact = {"fullscreen": self.fullscreen}
+            w, h = self.px(820), self.px(600)
+            # Plain runtime changes: Cinnamon's window manager applies -fullscreen and -topmost on a
+            # mapped window, but forgets both when the window is withdrawn and shown again.
+            try:
+                self.attributes("-fullscreen", False)
+                self.attributes("-zoomed", False)
+            except tk.TclError:
+                pass
+            self.minsize(1, 1)
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            self.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 2)))
+            try:
+                self.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            self.configure(bg=C["bg"])
+            self.panel.place(relx=0.5, rely=0.5, anchor="center", relwidth=1.0, relheight=1.0)
+
+        def leave_compact(self):
+            if self.compact is None:
+                return
+            saved, self.compact = self.compact, None
+            self.minsize(900, 640)
+            try:
+                self.attributes("-topmost", False)
+            except tk.TclError:
+                pass
+            self.configure(bg=C["surround"] if SCALE < 0.999 else C["bg"])
+            self.panel.place(relx=0.5, rely=0.5, anchor="center", relwidth=SCALE, relheight=SCALE)
+            try:
+                if saved["fullscreen"]:
+                    self.attributes("-fullscreen", True)
+                else:
+                    self.attributes("-zoomed", True)
+            except tk.TclError:
+                pass
+
+        def mask_raise(self):
+            if not self.mk_active:
+                return
+            try:
+                self.lift()
+                self.focus_force()
+            except tk.TclError:
+                pass
+
+        MASK_KEYS = ("<Up>", "<Down>", "<Left>", "<Right>", "<Shift-Left>", "<Shift-Right>",
+                     "<minus>", "<plus>", "<equal>", "<KP_Subtract>", "<KP_Add>")
+
+        def bind_mask_keys(self):
+            self.bind("<Up>", lambda e: self.mask_select_step(-1))
+            self.bind("<Down>", lambda e: self.mask_select_step(1))
+            self.bind("<Left>", lambda e: self.mask_nudge(-1))
+            self.bind("<Right>", lambda e: self.mask_nudge(1))
+            self.bind("<Shift-Left>", lambda e: self.mask_nudge(-5))
+            self.bind("<Shift-Right>", lambda e: self.mask_nudge(5))
+            for seq in ("<minus>", "<KP_Subtract>"):
+                self.bind(seq, lambda e: self.mask_nudge(-1))
+            for seq in ("<plus>", "<equal>", "<KP_Add>"):
+                self.bind(seq, lambda e: self.mask_nudge(1))
+            self.focus_set()
+
+        def unbind_mask_keys(self):
+            for seq in self.MASK_KEYS:
+                self.unbind(seq)
+
+        def show_mask(self):
+            self.clear()
+            self.session = None
+            margins, enabled, exists, err = self.mask_state()
+            sc, labels, gerr = self.mask_geometry(margins)
+            missing = self.mask_prerequisites()
+            if sc is not None and not gerr and not missing:
+                self.enter_compact()
+            self.sandbox_bar = self.header("Phase %d: edge mask" % phase_number(PH_MASK),
+                                           "Black outside the box. Move each edge until the black just covers the wall.",
+                                           compact=self.compact is not None)
+            self.refresh_sandbox_bar()
+            if gerr or missing:
+                if missing:
+                    self.notice(self.body, "Run %s first: the mask is computed from the measured corners and the "
+                                "projector calibration." % " and ".join(missing), "warn", prefix="Not yet:  ")
+                if gerr:
+                    self.notice(self.body, gerr, "bad", prefix="Problem:  ")
+                ttk.Button(self.button_row(), text="Back to overview", style="Secondary.TButton",
+                           command=self.abort_to_hub).pack(side="right")
+                return
+            if err:
+                self.notice(self.body, err + "  The values below start from 0 and replace the file when changed.",
+                            "warn", prefix="Check:  ")
+
+            self.mk_margins = dict(margins)
+            self.mk_enabled = enabled
+            self.mk_labels = labels
+            self.mk_by_label = dict((labels[e], e) for e in MASK_EDGES)
+            self.mk_rows = [self.mk_by_label[l] for l in MASK_LABELS if l in self.mk_by_label]
+            self.mk_selected = self.mk_rows[0]
+            self.mk_step = 1.0
+            self._mk_pending = None
+            self._mk_written = None
+            self._mk_backed_up = False
+            self._mk_timer = None
+            self._mk_front_timer = None
+            self.mk_active = True
+
+            card = self.card(self.body, padx=self.px(16), pady=self.px(12))
+            cols = tk.Frame(card, bg=C["card"])
+            cols.pack(fill="x")
+            left = tk.Frame(cols, bg=C["card"])
+            left.pack(side="left", anchor="n")
+            self.mk_canvas = tk.Canvas(left, width=self.px(300), height=self.px(225), bg=C["card"], highlightthickness=0)
+            self.mk_canvas.pack(anchor="n")
+            self.label(left, "The projector image; black is masked", font=self.f_small, fg=C["muted"]).pack(anchor="w")
+
+            right = tk.Frame(cols, bg=C["card"])
+            right.pack(side="left", anchor="n", fill="x", expand=True, padx=(self.px(18), self.px(0)))
+            self.mk_row_widgets = {}
+            for e in self.mk_rows:
+                row = tk.Frame(right, bg=C["card"])
+                row.pack(fill="x", pady=(self.px(0), self.px(5)))
+                name = ttk.Button(row, text=self.mk_labels[e], width=8, command=lambda e=e: self.mask_select(e))
+                name.pack(side="left")
+                minus = ttk.Button(row, text="\u2212", width=3, style="Secondary.TButton",
+                                   command=lambda e=e: self.mask_nudge(-1, e))
+                minus.pack(side="left", padx=(self.px(8), self.px(0)))
+                value = self.label(row, format_cm(self.mk_margins[e]), font=self.f_mono, width=9, anchor="center")
+                value.pack(side="left")
+                plus = ttk.Button(row, text="+", width=3, style="Secondary.TButton",
+                                  command=lambda e=e: self.mask_nudge(1, e))
+                plus.pack(side="left")
+                self.mk_row_widgets[e] = (name, value)
+            steps = tk.Frame(right, bg=C["card"])
+            steps.pack(fill="x", pady=(self.px(6), self.px(0)))
+            self.label(steps, "Step", fg=C["muted"]).pack(side="left", padx=(self.px(0), self.px(8)))
+            self.mk_step_buttons = {}
+            for step in (0.5, 1.0, 5.0):
+                b = ttk.Button(steps, text="%g cm" % step, width=6, command=lambda s=step: self.mask_set_step(s))
+                b.pack(side="left", padx=(self.px(0), self.px(6)))
+                self.mk_step_buttons[step] = b
+            self.mk_enabled_var = tk.BooleanVar(value=self.mk_enabled)
+            ttk.Checkbutton(right, text="Mask on", variable=self.mk_enabled_var, style="Card.TCheckbutton",
+                            command=self.mask_toggle).pack(anchor="w", pady=(self.px(10), self.px(0)))
+
+            self.mk_hint = tk.Frame(self.body, bg=C["bg"])
+            self.mk_hint.pack(fill="x")
+            buttons = self.button_row()
+            ttk.Button(buttons, text="Done", style="Primary.TButton", command=self.mask_done).pack(side="left")
+            ttk.Button(buttons, text="Reset all to 0", style="Secondary.TButton",
+                       command=self.mask_reset).pack(side="left", padx=(self.px(10), self.px(0)))
+            ttk.Button(buttons, text="Back to overview", style="Secondary.TButton",
+                       command=self.abort_to_hub).pack(side="right")
+
+            self.mask_refresh_rows()
+            self.mask_draw_diagram()
+            self.mask_refresh_hint()
+            self.bind_mask_keys()
+            # write the file now (creating it the first time) so a running sandbox shows the outline at once
+            self.mask_commit(force=True)
+            self._mk_timer = self.after(15000, self.mask_highlight_tick)
+            self._mk_front_timer = self.after(300, self.mask_keep_front)
+
+        def mask_refresh_rows(self):
+            for e, (name, value) in self.mk_row_widgets.items():
+                if not value.winfo_exists():
+                    continue
+                value.configure(text=format_cm(self.mk_margins[e]),
+                                fg=C["accent"] if e == self.mk_selected else C["text"])
+                name.configure(style="Small.Primary.TButton" if e == self.mk_selected else "Small.Secondary.TButton")
+            for step, b in self.mk_step_buttons.items():
+                if b.winfo_exists():
+                    b.configure(style="Small.Primary.TButton" if abs(step - self.mk_step) < 1e-9 else "Small.Secondary.TButton")
+
+        def mask_draw_diagram(self):
+            cv = getattr(self, "mk_canvas", None)
+            if cv is None or not cv.winfo_exists():
+                return
+            cv.delete("all")
+            w, h = int(cv.cget("width")), int(cv.cget("height"))
+            cv.create_rectangle(0, 0, w, h, fill="#111827", outline="")
+            sc, labels, err = self.mask_geometry(self.mk_margins)
+            if sc is None:
+                cv.create_text(w / 2, h / 2, text="cannot compute", fill="#f9fafb", font=self.f_small)
+                return
+            pts = [((x + 1.0) / 2.0 * w, (1.0 - y) / 2.0 * h) for x, y in sc]
+            order = [0, 1, 3, 2]  # LL, LR, UR, UL around the outline
+            poly = []
+            for i in order:
+                poly += [pts[i][0], pts[i][1]]
+            if self.mk_enabled:
+                cv.create_polygon(poly, fill="#e7d3a1", outline="#f9fafb", width=1)
+            else:
+                cv.create_rectangle(0, 0, w, h, fill="#e7d3a1", outline="")
+                cv.create_polygon(poly, fill="", outline="#9ca3af", width=1, dash=(3, 3))
+            for e in MASK_EDGES:
+                a, b = MASK_EDGE_CORNERS[e]
+                if e == self.mk_selected:
+                    cv.create_line(pts[a][0], pts[a][1], pts[b][0], pts[b][1], fill=C["accent"], width=self.px(4))
+                mx, my = (pts[a][0] + pts[b][0]) / 2.0, (pts[a][1] + pts[b][1]) / 2.0
+                cx, cy = w / 2.0, h / 2.0
+                dx, dy = mx - cx, my - cy
+                d = math.hypot(dx, dy) or 1.0
+                tx, ty = mx - dx / d * self.px(22), my - dy / d * self.px(14)
+                cv.create_text(min(max(tx, self.px(18)), w - self.px(18)), min(max(ty, self.px(8)), h - self.px(8)),
+                               text=self.mk_labels[e], fill=C["accent"] if e == self.mk_selected else "#374151",
+                               font=self.f_small_b)
+
+        def mask_refresh_hint(self):
+            f = getattr(self, "mk_hint", None)
+            if f is None or not f.winfo_exists():
+                return
+            for w in f.winfo_children():
+                w.destroy()
+            if not paths.mask_vislet:
+                self.notice(f, "The SandboxMask plug-in is not installed, so the sandbox cannot show the mask. "
+                            "Run the installer (payload only) to build it; the values are saved anyway.", "bad",
+                            prefix="Problem:  ")
+            elif sandbox_pids(paths.sandbox_process):
+                self.notice(f, "The sandbox is showing the mask. The edge you are moving is yellow, the outline "
+                            "white. Keys: \u2191 \u2193 pick an edge, \u2190 \u2192 move it (Shift: 5 steps). "
+                            "Every change is saved by itself; this panel stays in front until Done.", "good")
+            else:
+                self.notice(f, "Launch the sandbox (top right) to see the mask on the sand; this panel comes "
+                            "back on top of it. Every change is saved by itself.", "info")
+
+        def mask_select(self, edge):
+            if edge not in MASK_EDGES:
+                return
+            self.mk_selected = edge
+            self.mask_refresh_rows()
+            self.mask_draw_diagram()
+            self.mask_schedule_commit()
+
+        def mask_select_step(self, direction):
+            i = self.mk_rows.index(self.mk_selected) if self.mk_selected in self.mk_rows else 0
+            self.mask_select(self.mk_rows[(i + direction) % len(self.mk_rows)])
+
+        def mask_set_step(self, step):
+            self.mk_step = step
+            self.mask_refresh_rows()
+
+        def mask_nudge(self, direction, edge=None):
+            if not self.mk_active:
+                return
+            edge = edge or self.mk_selected
+            self.mk_selected = edge
+            self.mask_set(edge, self.mk_margins[edge] + self.mk_step * direction)
+
+        def mask_set(self, edge, value):
+            value = max(-MASK_LIMIT, min(MASK_LIMIT, round(value * 2.0) / 2.0))
+            self.mk_margins[edge] = value
+            self.mask_refresh_rows()
+            self.mask_draw_diagram()
+            self.mask_schedule_commit()
+
+        def mask_toggle(self):
+            self.mk_enabled = bool(self.mk_enabled_var.get())
+            self.mask_draw_diagram()
+            self.mask_schedule_commit()
+
+        def mask_reset(self):
+            for e in MASK_EDGES:
+                self.mk_margins[e] = 0.0
+            self.mask_refresh_rows()
+            self.mask_draw_diagram()
+            self.mask_schedule_commit()
+
+        def mask_schedule_commit(self):
+            # save once the operator pauses, so a run of key presses writes the file once
+            if self._mk_pending is not None:
+                self.after_cancel(self._mk_pending)
+            self._mk_pending = self.after(250, self.mask_commit)
+
+        def mask_commit(self, force=False, highlight=True):
+            """Write EdgeMask.cfg; the plug-in in a running sandbox picks it up within half a second."""
+            self._mk_pending = None
+            selected = self.mk_selected if highlight else None
+            key = (tuple(self.mk_margins[e] for e in MASK_EDGES), self.mk_enabled, selected)
+            if not force and key == self._mk_written:
+                return
+            values_changed = self._mk_written is None or key[:2] != self._mk_written[:2]
+            if not self._mk_backed_up and os.path.isfile(paths.edge_mask):
+                backup_file(paths.edge_mask, paths.backup_dir)
+                self._mk_backed_up = True
+            try:
+                write_edge_mask(paths.edge_mask, self.mk_margins, self.mk_enabled, selected)
+            except OSError as e:
+                log.write("Could not write %s: %s" % (paths.edge_mask, e))
+                return
+            self._mk_written = key
+            if values_changed:
+                state.mark("mask", margins=dict(self.mk_margins), enabled=self.mk_enabled)
+                labels = self.mk_labels
+                log.write("Edge mask %s: %s" % ("on" if self.mk_enabled else "off", ", ".join(
+                    "%s %s" % (labels[e], format_cm(self.mk_margins[e])) for e in self.mk_rows)))
+            self.mask_refresh_hint()
+
+        def mask_highlight_tick(self):
+            """Keep the outline showing in the sandbox: the plug-in drops it 30 s after the file was written."""
+            self._mk_timer = None
+            if not self.mk_active:
+                return
+            if self.mk_selected is not None and os.path.isfile(paths.edge_mask):
+                try:
+                    os.utime(paths.edge_mask, None)
+                except OSError:
+                    pass
+            self._mk_timer = self.after(15000, self.mask_highlight_tick)
+
+        def mask_keep_front(self):
+            """A focused fullscreen sandbox window covers even an always-on-top panel, so while this
+            screen is open the panel takes the focus back whenever the sandbox has it."""
+            self._mk_front_timer = None
+            if not self.mk_active:
+                return
+            try:
+                has_focus = self.focus_get() is not None
+            except (KeyError, tk.TclError):
+                has_focus = False
+            if not has_focus and sandbox_pids(paths.sandbox_process):
+                self.mask_raise()
+            self._mk_front_timer = self.after(3000, self.mask_keep_front)
+
+        def mask_flush(self):
+            """Leaving the screen: write what is pending and take the highlight out of the file."""
+            if not getattr(self, "mk_active", False):
+                return
+            self.mk_active = False
+            self.unbind_mask_keys()
+            if self._mk_front_timer is not None:
+                self.after_cancel(self._mk_front_timer)
+                self._mk_front_timer = None
+            if self._mk_pending is not None:
+                self.after_cancel(self._mk_pending)
+                self._mk_pending = None
+            if self._mk_timer is not None:
+                self.after_cancel(self._mk_timer)
+                self._mk_timer = None
+            self.mask_commit(force=True, highlight=False)
+
+        def mask_done(self):
+            self.mask_flush()
+            self.next_session()
+
         # ---------------- hub ----------------
         def show_hub(self):
             self.clear()
@@ -2038,6 +2664,7 @@ def build_app(paths, log=None, state=None, scale=None):
                  "\n".join("%-12s %s" % (n + ":", short_point(c)) for n, c in zip(CORNER_NAMES, corners))
                  if corners else "-"),
                 (PH_PROJECTOR, "Aligns the projected image with the camera", "Resolution %dx%d" % self.resolution),
+                (PH_MASK, "Blacks out the projection beyond the box walls", self.mask_values_text()),
             ]
             for phase, desc, values in [r for r in rows if r[0] in ALL_PHASES]:
                 status, kind = self.phase_status(phase)
@@ -2125,6 +2752,10 @@ def build_app(paths, log=None, state=None, scale=None):
                 return
             launch_sandbox(paths, log)
             self.after(1500, self.refresh_sandbox_bar)
+            if self.mk_active:
+                # the sandbox window takes the screen while it starts; come back on top of it
+                for delay in (4000, 8000, 14000):
+                    self.after(delay, self.mask_raise)
 
         def run_ticked(self):
             phases = [p for p in ALL_PHASES if self.phase_vars[p].get()]
@@ -2135,9 +2766,14 @@ def build_app(paths, log=None, state=None, scale=None):
 
         def restore_defaults(self):
             if not messagebox.askyesno(APP_TITLE, "Replace BoxLayout.txt and ProjectorMatrix.dat with the "
-                                                  "factory default files and set the color height back to 0 cm?"
+                                                  "factory default files, set the color height back to 0 cm "
+                                                  "and remove the edge mask?"
                                                   "\n\nThe current files are backed up first."):
                 return
+            if os.path.isfile(paths.edge_mask):
+                backup = backup_file(paths.edge_mask, paths.backup_dir)
+                os.remove(paths.edge_mask)
+                log.write("Removed %s (backup: %s); the sandbox shows no edge mask" % (paths.edge_mask, backup))
             for src, dst in ((paths.box_layout_orig, paths.box_layout),
                              (paths.projector_matrix_orig, paths.projector_matrix)):
                 if os.path.isfile(src):
@@ -2174,6 +2810,10 @@ def build_app(paths, log=None, state=None, scale=None):
         def next_session(self):
             if not self.queue:
                 self.show_hub()
+                return
+            if self.queue[0] == PH_MASK:
+                self.queue.pop(0)
+                self.show_mask()
                 return
             if self.queue[0] == PH_DEPTH:
                 self.queue.pop(0)
@@ -2853,6 +3493,7 @@ def build_app(paths, log=None, state=None, scale=None):
         # ---------------- close ----------------
         def on_close(self):
             self.ch_flush()
+            self.mask_flush()
             if self.runner is not None and self.runner.running():
                 if not messagebox.askyesno(APP_TITLE, "%s is still running. Stop it and quit?" % self.session.tool_name):
                     return

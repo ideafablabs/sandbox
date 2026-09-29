@@ -6,8 +6,9 @@
 #                   calibration, then installs the payload (desktop icons, Vrui configs,
 #                   helper scripts, the Calibrate Sandbox wizard) and adjusts desktop settings.
 # Existing install: skips whatever is already built, refreshes the payload and KEEPS the
-#                   sandbox calibration (BoxLayout.txt and ProjectorMatrix.dat). Every file the
-#                   payload replaces is copied to ~/sandbox-backup-<date> first. Safe to re-run.
+#                   sandbox calibration (BoxLayout.txt, ProjectorMatrix.dat, the edge mask in
+#                   EdgeMask.cfg and SARndbox.cfg). Every file the payload replaces is copied to
+#                   ~/sandbox-backup-<date> first. Safe to re-run.
 #
 # Usage: one line, pasted into a terminal as the normal user (it asks for the sudo
 # password itself where it needs root):
@@ -158,7 +159,7 @@ tar xzf "$PAYLOAD" -C "$HOME" || die "could not unpack the payload"
 
 if [ -n "$BACKUP_DIR" ]; then
     KEPT=0
-    for f in src/SARndbox-2.8/etc/SARndbox-2.8/BoxLayout.txt src/SARndbox-2.8/etc/SARndbox-2.8/ProjectorMatrix.dat src/SARndbox-2.8/etc/SARndbox-2.8/SARndbox.cfg; do
+    for f in src/SARndbox-2.8/etc/SARndbox-2.8/BoxLayout.txt src/SARndbox-2.8/etc/SARndbox-2.8/ProjectorMatrix.dat src/SARndbox-2.8/etc/SARndbox-2.8/SARndbox.cfg src/SARndbox-2.8/etc/SARndbox-2.8/EdgeMask.cfg; do
         if [ -f "$BACKUP_DIR/$f" ]; then
             cp -a "$BACKUP_DIR/$f" "$HOME/$f" && KEPT=$((KEPT + 1))
         fi
@@ -189,23 +190,31 @@ else
     mkfifo "$FIFO" && note "Control.fifo:       created"
 fi
 
-# ---------------------------------------------------------------------- SandboxHelper plugin
-# A small Vrui plugin (vislet) the wizard loads into RawKinectViewer so it can switch on
-# "Average Frames" by itself and replace its popups. Built against the installed Vrui.
-VISLET_SRC=$SANDBOX_DIR/SandboxHelper
+# ---------------------------------------------------------------------- Vrui plugins
+# Two small Vrui plugins (vislets), built against the installed Vrui and put into its
+# VRVislets directory. SandboxHelper: the wizard loads it into RawKinectViewer to switch on
+# "Average Frames" by itself and replace its popups. SandboxMask: run-sandbox.sh loads it into
+# SARndbox to black out the projection outside the box (margins in etc/SARndbox-2.8/EdgeMask.cfg,
+# set from the wizard's Edge mask phase).
 VRUI_MAKEINCLUDE=/usr/local/share/Vrui-8.0/Vrui.makeinclude
-if [ -f "$VISLET_SRC/SandboxHelper.cpp" ] && [ -f "$VRUI_MAKEINCLUDE" ]; then
-    say "Building the SandboxHelper plugin (lets the wizard switch on Average Frames by itself)"
-    make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" clean >/dev/null 2>&1  # never install a stale binary
-    if make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" && sudo make -C "$VISLET_SRC" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" install; then
-        note "SandboxHelper:      built and installed"
+build_plugin() {   # build_plugin <name> <what it does>
+    local name=$1 purpose=$2 src=$SANDBOX_DIR/$1 label
+    label=$(printf '%-19s' "$name:")
+    if [ -f "$src/$name.cpp" ] && [ -f "$VRUI_MAKEINCLUDE" ]; then
+        say "Building the $name plugin ($purpose)"
+        make -C "$src" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" clean >/dev/null 2>&1  # never install a stale binary
+        if make -C "$src" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" && sudo make -C "$src" VRUI_MAKEINCLUDE="$VRUI_MAKEINCLUDE" install; then
+            note "$label built and installed"
+        else
+            echo "WARNING: the $name plugin did not build ($purpose)" >&2
+            note "$label NOT installed (build failed, see above)"
+        fi
     else
-        echo "WARNING: the SandboxHelper plugin did not build; the wizard falls back to picking Average Frames by hand" >&2
-        note "SandboxHelper:      NOT installed (build failed, see above)"
+        note "$label skipped (Vrui makefile fragment or plugin source not found)"
     fi
-else
-    note "SandboxHelper:      skipped (Vrui makefile fragment or plugin source not found)"
-fi
+}
+build_plugin SandboxHelper "lets the wizard switch on Average Frames by itself"
+build_plugin SandboxMask "blacks out the projection outside the box"
 
 # ---------------------------------------------------------------------- desktop settings
 # Background picture, no screensaver / display sleep, sound off, bigger desktop icons.

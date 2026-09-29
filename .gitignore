@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 Sandbox-Install-Payload-3.0/src/SARndbox-3.0/SandboxHelper/*.so
 Sandbox-Install-Payload-3.0/src/SARndbox-3.0/SandboxHelper/*.o
+Sandbox-Install-Payload-3.0/src/SARndbox-3.0/SandboxMask/*.so
+Sandbox-Install-Payload-3.0/src/SARndbox-3.0/SandboxMask/*.o

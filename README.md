@@ -56,8 +56,8 @@ already there:
 - The camera calibration is kept when `IntrinsicParameters-*.dat` exists
   (`--recalibrate-camera` redoes it).
 - Every file the payload will replace is copied to `~/sandbox-backup-<date>` first.
-- The payload is unpacked, then **your `BoxLayout.txt` and `ProjectorMatrix.dat`
-  are put back**, so the sandbox stays calibrated.
+- The payload is unpacked, then **your `BoxLayout.txt`, `ProjectorMatrix.dat` and
+  `EdgeMask.cfg` are put back**, so the sandbox stays calibrated.
 - Old icons that the wizard replaces (ExtractPlanes, Measure3D, CalibrateProjector)
   are removed and `python3-tk` is installed if missing.
 
@@ -94,13 +94,14 @@ both can be run from a terminal.
 ## Calibrate Sandbox
 
 `bin/CalibrateSandbox.py` (started by `bin/CalibrateSandbox.sh`) wraps the
-UC Davis calibration steps into one window with three phases:
+UC Davis calibration steps into one window with four phases:
 
 1. **Base plane** - RawKinectViewer, "Average Frames" (pressed by the SandboxHelper plugin, see below) then key `1` to drag a box over flat sand.
 2. **Box corners** - RawKinectViewer, key `2` on the four corners (lower-left, lower-right, upper-left, upper-right).
 3. **Projector** - CalibrateProjector with the calibration disk, key `1` per point, key `2` to re-capture the background.
+4. **Edge mask** - the SandboxMask plugin in the running sandbox; nudge each edge from the wizard until the black just covers the box wall.
 
-A fourth phase, the camera depth lens, is built but hidden (see below). Phases 1
+A fifth phase, the camera depth lens, is built but hidden (see below). Phases 1
 and 2 share one RawKinectViewer window. The wizard:
 
 - shows which phases are done and the current values, and lets you tick which phases to run;
@@ -131,6 +132,51 @@ re-applied automatically when the base plane is recalibrated or edited, and
 (the rest of `SARndbox.cfg`, such as the water speed and camera settings, is
 left alone).
 
+**Edge mask** (phase 4) blacks out everything the projector would draw outside
+the box. SARndbox has no setting for this: it draws the whole camera image
+through the projector, so the box rim comes out as snow and the floor around the
+box as sea level, and tightening the elevation range does not blank anything.
+The mask is a small Vrui plugin, `SandboxMask/`, that `run-sandbox.sh` loads into
+SARndbox with `-vislet SandboxMask etc/SARndbox-2.8 ;`. It reads `BoxLayout.txt`
+and `ProjectorMatrix.dat`, projects the four measured corners onto the screen the
+same way SARndbox projects the sand, grows that rectangle by a margin per edge and
+paints everything outside it black. Because it starts from the calibration files
+at every start, redoing the corners or the projector never breaks it. (Vrui draws
+plugins before the application, so the plugin writes its black into the depth
+buffer at the near plane; the sand surface drawn afterwards fails the depth test
+there and stays black.)
+
+The margins live in `etc/SARndbox-2.8/EdgeMask.cfg`:
+
+```
+enabled 1
+left 1.5        # cm outside the measured corners: positive shows more,
+right 1.5       # negative hides more
+bottom 0
+top -0.5
+highlight left  # optional: outline plus this edge in colour, for 30 s
+```
+
+The edges are named as the camera sees the corners; the wizard shows them by
+where they land on the screen. In the wizard the phase shrinks the window to a
+small always-on-top panel in the middle of the screen, so the sandbox stays
+visible around it, and draws the mask as a diagram. The panel takes the focus
+back if the sandbox window is clicked, until Done is pressed. Each edge has - and + buttons
+(step 0.5, 1 or 5 cm), or use the arrow keys: up/down pick an edge, left/right
+move it, Shift for five steps. As with the Color height there is no Save button:
+every change is written to `EdgeMask.cfg` after a short pause, the plugin re-reads
+the file within half a second, and the running sandbox draws the edge being moved
+in yellow with the whole outline in white. Opening the phase for the first time
+creates the file with all margins at 0, which is the measured corner rectangle
+itself; "Mask on" switches the mask off without losing the margins. The phase
+needs the box corners and the projector calibrated first. Restore factory
+defaults removes the file, and the installer keeps it across updates like the
+other calibration files. Without the plugin (build failed) Vrui prints "Ignoring
+vislet of type SandboxMask", the sandbox runs unmasked and the wizard says so on
+the overview. The plugin also takes console commands on stdin (`sandboxMaskInfo`,
+`sandboxMaskReload`, `sandboxMaskSet <l> <r> <b> <t>`, `sandboxMaskEnable on|off`,
+`sandboxMaskHighlight <edge>|off`) for testing by hand.
+
 **The camera depth lens phase** (per-pixel depth correction) is the UC Davis
 "Calibrate Depth Lens" step. A Kinect reads a flat surface as slightly
 bowl-shaped, and this measures that distortion from several distances and saves
@@ -145,7 +191,7 @@ the wizard shows the three phases above. Start it with:
 SANDBOX_CALIB_DEPTH=1 ~/src/SARndbox-2.8/bin/CalibrateSandbox.sh
 ```
 
-It then appears as phase 1 and the others become phases 2 to 4; the numbers on
+It then appears as phase 1 and the others become phases 2 to 5; the numbers on
 screen always follow the phases that are visible. It is pre-ticked only while no
 correction file exists, its screen has a **Skip this phase** button, and because
 it changes every depth reading it marks the other phases for a redo afterwards,
@@ -190,7 +236,8 @@ screen, with a dark surround, so the content lands on the sand rather than on
 the box edges. Change it with `--scale 0.5` to `--scale 1.0` (full screen) or
 `SANDBOX_CALIB_SCALE`.
 
-**SandboxHelper plugin.** RawKinectViewer has no command-line switch for
+**SandboxHelper plugin.** (SandboxMask, above, is built and installed the same
+way.) RawKinectViewer has no command-line switch for
 "Average Frames", and the plane tool needs it. `SandboxHelper/` is a small Vrui
 plugin (a "vislet", built by the install script against the installed Vrui and
 put into Vrui's `VRVislets` directory) that the wizard loads into the tools with
